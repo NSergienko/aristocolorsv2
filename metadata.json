@@ -1,0 +1,6 @@
+{
+  "name": "AristoColors Studio",
+  "description": "Professional photobashing and visual style harmonization graphics editor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,176 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    /* Palette Tokens: Graphite, Slate, Ultra Violet, Ice Blue, Silver */
+    --surface-bg: #0d101a;          /* Deep Graphite canvas backdrop */
+    --surface-panel: #131724;       /* Base structural panels & toolbars */
+    --surface-elevated: #171b29;    /* Glossy Graphite cards, modal surfaces */
+    --surface-card: #171b29;        /* Card bodies */
+    --surface-hover: #1e2436;       /* Interactive hover state */
+    --surface-active: #252d43;      /* Pressed/active state */
+
+    --border-subtle: #202638;       /* Subtle structural dividers */
+    --border-strong: #293047;       /* Slate border */
+    --border-highlight: rgba(215, 222, 237, 0.12); /* Metallic top hairline */
+    --border-focus: #7a1fa2;        /* Pantone 254 PC purple focus ring */
+
+    --text-primary: #d7deed;        /* Silver primary text */
+    --text-secondary: #8e9ab8;      /* Slate secondary text */
+    --text-muted: #5e6985;          /* Muted text & placeholders */
+
+    --accent-purple: #7a1fa2;       /* Pantone 254 PC primary purple */
+    --accent-purple-hover: #9135b7; /* Subtle gloss hover */
+    --accent-purple-active: #642083;/* Active pressed state */
+    --accent-ice: #38bdf8;          /* Ice Blue reserved strictly for technical status indicators */
+    --accent-emerald: #10b981;      /* Success / Verified */
+    --accent-amber: #f59e0b;        /* Warning / Favorites */
+    --accent-rose: #f43f5e;         /* Destructive */
+  }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    min-height: 100%;
+    background-color: var(--surface-bg);
+    color: var(--text-primary);
+    font-family:
+      'Plus Jakarta Sans',
+      -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      Roboto,
+      Helvetica,
+      Arial,
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    user-select: none;
+  }
+
+  #root {
+    width: 100%;
+    min-height: 100%;
+  }
+
+  code, kbd, samp, pre {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+}
+
+/* Layered Glass & Glossy Metallic Surfaces */
+.glass-panel {
+  background: rgba(19, 23, 36, 0.88);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid #293047;
+  box-shadow: inset 0 1px 0 0 rgba(215, 222, 237, 0.08);
+}
+
+.glass-card {
+  background: #171b29;
+  border: 1px solid #242b3f;
+  box-shadow: inset 0 1px 0 0 rgba(215, 222, 237, 0.06), 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+}
+
+.glass-card:hover {
+  border-color: rgba(122, 31, 162, 0.45);
+  box-shadow: inset 0 1px 0 0 rgba(215, 222, 237, 0.12), 0 14px 30px -5px rgba(122, 31, 162, 0.15);
+}
+
+.metallic-highlight {
+  position: relative;
+}
+
+.metallic-highlight::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(215, 222, 237, 0.18), transparent);
+  pointer-events: none;
+}
+
+/* Studio Dense Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #242b3f;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #323b57;
+}
+
+/* Studio Canvas Checked Transparency Pattern */
+.bg-canvas-checker {
+  background-color: #121520;
+  background-image:
+    linear-gradient(45deg, #0d101a 25%, transparent 25%),
+    linear-gradient(-45deg, #0d101a 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #0d101a 75%),
+    linear-gradient(-45deg, transparent 75%, #0d101a 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0px;
+}
+
+/* Subtle Cinematic Motion for Hero Concept Artwork */
+@keyframes heroLightDrift {
+  0%, 100% {
+    opacity: 0.35;
+    transform: translate3d(-3%, -2%, 0) scale(1);
+  }
+  50% {
+    opacity: 0.65;
+    transform: translate3d(3%, 2%, 0) scale(1.05);
+  }
+}
+
+@keyframes heroAtmosphereScan {
+  0% {
+    transform: translate3d(-10%, 0, 0);
+    opacity: 0.25;
+  }
+  50% {
+    transform: translate3d(8%, 0, 0);
+    opacity: 0.55;
+  }
+  100% {
+    transform: translate3d(-10%, 0, 0);
+    opacity: 0.25;
+  }
+}
+
+.hero-ambient-light {
+  animation: heroLightDrift 12s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+.hero-atmosphere-drift {
+  animation: heroAtmosphereScan 16s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-ambient-light,
+  .hero-atmosphere-drift {
+    animation: none !important;
+    transform: none !important;
+  }
+}
