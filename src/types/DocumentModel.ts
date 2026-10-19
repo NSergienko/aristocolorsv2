@@ -179,6 +179,8 @@ export interface LayerLighting {
   color: string;
   /** RGB blend operation within the light's area. */
   blendMode: 'screen' | 'multiply' | 'soft-light';
+  /** Optional asset ID of a grayscale influence mask. */
+  maskAssetId?: string;
 }
 
 /**

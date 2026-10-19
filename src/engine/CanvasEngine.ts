@@ -1,4 +1,4 @@
- /**
+/**
  * AristoColors v2 - Canvas Engine (Core Renderer)
  *
  * Implements Step 4 of the AristoColors Studio architecture.
@@ -456,30 +456,51 @@ export class CanvasEngine {
       const adjustmentKey = isAdjustmentActive(layer.adjustments)
         ? computeAdjustmentCacheKey(layer.id, layer.sourceAssetId, layer.adjustments)
         : 'no-adjustments';
-      const lightingKey = JSON.stringify([
-        layer.sourceAssetId, sourceVersion, width, height, adjustmentKey,
-        lighting.x, lighting.y, lighting.angle, lighting.intensity,
-        lighting.radius, lighting.softness, lighting.color, lighting.blendMode,
-      ]);
-      const cachedLighting = this.lightingCache.get(layer.id);
-      if (cachedLighting?.key === lightingKey) {
-        imageSource = cachedLighting.canvas;
-      } else {
-        // LightingEngine accepts only HTMLCanvasElement, so normalize any
-        // registered CanvasImageSource without modifying its pixel buffer.
-        const sourceCanvas = document.createElement('canvas');
-        sourceCanvas.width = Math.max(1, Math.round(width));
-        sourceCanvas.height = Math.max(1, Math.round(height));
-        const sourceCtx = sourceCanvas.getContext('2d');
-        if (sourceCtx) {
-          sourceCtx.drawImage(imageSource, 0, 0, sourceCanvas.width, sourceCanvas.height);
-          try {
-            const litCanvas = LightingEngine.render(sourceCanvas, lighting);
-            this.lightingCache.set(layer.id, { key: lightingKey, canvas: litCanvas });
-            imageSource = litCanvas;
-          } catch (error) {
-            // A tainted or unreadable asset must not break normal layer rendering.
-            console.warn('[CanvasEngine] Lighting preview unavailable:', error);
+        
+      let shouldApplyLighting = true;
+      let maskSource: CanvasImageSource | undefined;
+      let maskKey = 'no-mask';
+      let maskVersion = 0;
+
+      if (lighting.maskAssetId) {
+        maskSource = this.imageRegistry.get(lighting.maskAssetId);
+        if (!maskSource) {
+          console.warn('[CanvasEngine] Lighting mask asset not found:', lighting.maskAssetId);
+          shouldApplyLighting = false;
+        } else {
+          maskKey = lighting.maskAssetId;
+          maskVersion = this.assetVersions.get(lighting.maskAssetId) ?? 0;
+        }
+      }
+      
+      if (shouldApplyLighting) {
+        const lightingKey = JSON.stringify([
+          layer.sourceAssetId, sourceVersion, width, height, adjustmentKey,
+          lighting.x, lighting.y, lighting.angle, lighting.intensity,
+          lighting.radius, lighting.softness, lighting.color, lighting.blendMode,
+          maskKey, maskVersion
+        ]);
+        
+        const cachedLighting = this.lightingCache.get(layer.id);
+        if (cachedLighting?.key === lightingKey) {
+          imageSource = cachedLighting.canvas;
+        } else {
+          // LightingEngine accepts only HTMLCanvasElement, so normalize any
+          // registered CanvasImageSource without modifying its pixel buffer.
+          const sourceCanvas = document.createElement('canvas');
+          sourceCanvas.width = Math.max(1, Math.round(width));
+          sourceCanvas.height = Math.max(1, Math.round(height));
+          const sourceCtx = sourceCanvas.getContext('2d');
+          if (sourceCtx) {
+            sourceCtx.drawImage(imageSource, 0, 0, sourceCanvas.width, sourceCanvas.height);
+            try {
+              const litCanvas = LightingEngine.render(sourceCanvas, lighting, maskSource);
+              this.lightingCache.set(layer.id, { key: lightingKey, canvas: litCanvas });
+              imageSource = litCanvas;
+            } catch (error) {
+              // A tainted or unreadable asset must not break normal layer rendering.
+              console.warn('[CanvasEngine] Lighting preview unavailable:', error);
+            }
           }
         }
       }

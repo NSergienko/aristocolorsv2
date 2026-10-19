@@ -1,44 +1,23 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- *
- * AristoColors — Non-destructive 2D Lighting Engine
- *
- * CONTRACT:
- * - Never modifies the source canvas.
- * - Returns a new canvas containing the lighting result.
- * - Preserves source alpha values exactly.
- * - Preserves source geometry and image dimensions.
- * - Does not generate or replace image content.
- * - Uses native Canvas 2D only.
- */
-
+/** AristoColors — non-destructive 2D lighting, sci-fi enhanced. */
 export type BlendMode = 'screen' | 'multiply' | 'soft-light';
 
 export interface LightingParams {
   x: number;
   y: number;
-  angle: number; // Degrees: 0 = right, 90 = down
-  intensity: number; // 0..1
-  radius: number; // Pixels
-  softness: number; // 0..1
-  color: string; // CSS color
+  angle: number;
+  intensity: number;
+  radius: number;
+  softness: number;
+  color: string;
   blendMode: BlendMode;
 }
 
 export class LightingEngine {
-  private static clamp(
-    value: number,
-    min: number,
-    max: number
-  ): number {
+  private static clamp(value: number, min: number, max: number): number {
     return Math.max(min, Math.min(max, value));
   }
 
-  private static finite(
-    value: number,
-    fallback: number
-  ): number {
+  private static finite(value: number, fallback: number): number {
     return Number.isFinite(value) ? value : fallback;
   }
 
@@ -47,359 +26,212 @@ export class LightingEngine {
     return x * x * (3 - 2 * x);
   }
 
-  /**
-   * Resolve a CSS color using the browser's Canvas parser.
-   * Returns normalized RGBA values.
-   */
-  private static parseColor(
-    color: string
-  ): [number, number, number, number] {
+  private static parseColor(color: string): [number, number, number, number] {
     const canvas = document.createElement('canvas');
     canvas.width = 1;
     canvas.height = 1;
-
-    const ctx = canvas.getContext('2d', {
-      willReadFrequently: true
-    });
-
-    if (!ctx) {
-      return [1, 1, 1, 1];
-    }
-
-    ctx.clearRect(0, 0, 1, 1);
-
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return [1, 1, 1, 1];
+    ctx.fillStyle = '#ffffff';
     try {
-      ctx.fillStyle = '#ffffff';
       ctx.fillStyle = color;
       ctx.fillRect(0, 0, 1, 1);
-
-      const data = ctx.getImageData(0, 0, 1, 1).data;
-      const alpha = data[3] / 255;
-
-      if (alpha <= 0) {
-        return [1, 1, 1, 0];
-      }
-
-      // Canvas returns premultiplied RGB for translucent
-      // fills, converted back into byte channels by
-      // getImageData. Normalize these values.
-      return [
-        data[0] / 255,
-        data[1] / 255,
-        data[2] / 255,
-        alpha
-      ];
+      const rgba = ctx.getImageData(0, 0, 1, 1).data;
+      return [rgba[0] / 255, rgba[1] / 255, rgba[2] / 255, rgba[3] / 255];
     } catch {
       return [1, 1, 1, 1];
     }
   }
 
-  /**
-   * Blend one normalized RGB channel.
-   */
-  private static blendChannel(
-    base: number,
-    light: number,
-    mode: BlendMode
-  ): number {
-    switch (mode) {
-      case 'screen':
-        return 1 - (1 - base) * (1 - light);
-
-      case 'multiply':
-        return base * light;
-
-      case 'soft-light': {
-        if (light <= 0.5) {
-          return base -
-            (1 - 2 * light) * base * (1 - base);
-        }
-
-        const d =
-          base <= 0.25
-            ? ((16 * base - 12) * base + 4) * base
-            : Math.sqrt(base);
-
-        return base + (2 * light - 1) * (d - base);
-      }
-
-      default:
-        return base;
-    }
+  private static blendChannel(base: number, light: number, mode: BlendMode): number {
+    if (mode === 'screen') return 1 - (1 - base) * (1 - light);
+    if (mode === 'multiply') return base * light;
+    if (light <= 0.5) return base - (1 - 2 * light) * base * (1 - base);
+    const d = base <= 0.25
+      ? ((16 * base - 12) * base + 4) * base
+      : Math.sqrt(base);
+    return base + (2 * light - 1) * (d - base);
   }
 
-  /**
-   * Calculate light influence at a pixel.
-   *
-   * The light is represented by a directional,
-   * soft-edged 2D field.
-   *
-   * Direction is simulated by shifting the
-   * illumination center along the chosen angle.
-   *
-   * This is a 2D approximation, not physically
-   * accurate 3D relighting.
-   */
-  private static calculateFalloff(
-    px: number,
-    py: number,
-    x: number,
-    y: number,
-    angle: number,
-    radius: number,
-    softness: number
-  ): number {
-    if (radius <= 0) {
-      return 0;
-    }
+  private static sampleMask(maskData: ImageData, u: number, v: number): number {
+    const { width, height, data } = maskData;
+    const x = this.clamp(u, 0, width - 1);
+    const y = this.clamp(v, 0, height - 1);
+    const x1 = Math.floor(x);
+    const y1 = Math.floor(y);
+    const x2 = Math.min(x1 + 1, width - 1);
+    const y2 = Math.min(y1 + 1, height - 1);
+    const fx = x - x1;
+    const fy = y - y1;
 
-    const radians = angle * Math.PI / 180;
+    const getVal = (ix: number, iy: number) => {
+      const idx = (iy * width + ix) * 4;
+      const r = data[idx] / 255;
+      const g = data[idx + 1] / 255;
+      const b = data[idx + 2] / 255;
+      const a = data[idx + 3] / 255;
+      return (0.2126 * r + 0.7152 * g + 0.0722 * b) * a;
+    };
 
-    // Shift illumination toward the selected direction.
-    const offset = radius * 0.25;
-
-    const centerX = x + Math.cos(radians) * offset;
-    const centerY = y + Math.sin(radians) * offset;
-
-    const dx = px - centerX;
-    const dy = py - centerY;
-
-    const distance = Math.sqrt(dx * dx + dy * dy);
-
-    if (distance >= radius) {
-      return 0;
-    }
-
-    const normalizedDistance = distance / radius;
-
-    // Softness controls how far the solid core extends.
-    const core = 1 - softness;
-
-    if (normalizedDistance <= core) {
-      return 1;
-    }
-
-    // At softness = 0, create a hard boundary.
-    if (softness <= 0) {
-      return 1;
-    }
-
-    const t =
-      (normalizedDistance - core) /
-      (1 - core);
-
-    return 1 - this.smoothstep(t);
+    const v1 = getVal(x1, y1) * (1 - fx) + getVal(x2, y1) * fx;
+    const v2 = getVal(x1, y2) * (1 - fx) + getVal(x2, y2) * fx;
+    return v1 * (1 - fy) + v2 * fy;
   }
 
-  /**
-   * Render lighting into a NEW canvas.
-   *
-   * The source canvas is never modified.
-   *
-   * @param source Original canvas
-   * @param params Lighting parameters
-   * @returns New canvas containing the result
-   */
+  private static getSourceDimensions(source: CanvasImageSource): { width: number; height: number } {
+    let width = 0;
+    let height = 0;
+
+    if (source instanceof HTMLCanvasElement || (typeof OffscreenCanvas !== 'undefined' && source instanceof OffscreenCanvas)) {
+      width = source.width;
+      height = source.height;
+    } else if (source instanceof HTMLVideoElement) {
+      width = source.videoWidth;
+      height = source.videoHeight;
+    } else if (source instanceof HTMLImageElement || (typeof SVGImageElement !== 'undefined' && source instanceof SVGImageElement)) {
+      width = source.naturalWidth;
+      height = source.naturalHeight;
+    } else if (typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap) {
+      width = source.width;
+      height = source.height;
+    }
+
+    if (width <= 0 || height <= 0 || !Number.isFinite(width) || !Number.isFinite(height)) {
+      throw new Error('LightingEngine: Invalid or unsupported mask dimensions.');
+    }
+
+    return { width, height };
+  }
+
   public static render(
     source: HTMLCanvasElement,
-    params: LightingParams
+    params: LightingParams,
+    maskSource?: CanvasImageSource | null
   ): HTMLCanvasElement {
     const width = source.width;
     const height = source.height;
-
     const result = document.createElement('canvas');
     result.width = width;
     result.height = height;
-
-    const resultCtx = result.getContext('2d', {
-      willReadFrequently: true
-    });
-
-    if (!resultCtx) {
-      throw new Error(
-        'LightingEngine: Cannot create output context.'
-      );
-    }
-
-    if (width === 0 || height === 0) {
-      return result;
-    }
-
-    const sourceCtx = source.getContext('2d', {
-      willReadFrequently: true
-    });
-
-    if (!sourceCtx) {
-      throw new Error(
-        'LightingEngine: Cannot read source context.'
-      );
-    }
-
-    const original = sourceCtx.getImageData(
-      0,
-      0,
-      width,
-      height
-    );
-
-    // Create independent output pixel data.
-    const output = new ImageData(
-      new Uint8ClampedArray(original.data),
-      width,
-      height
-    );
-
-    const intensity = this.clamp(
-      this.finite(params.intensity, 0),
-      0,
-      1
-    );
-
-    const softness = this.clamp(
-      this.finite(params.softness, 0.5),
-      0,
-      1
-    );
-
-    const radius = Math.max(
-      0,
-      this.finite(params.radius, 0)
-    );
-
-    const x = this.finite(params.x, width / 2);
-    const y = this.finite(params.y, height / 2);
-    const angle = this.finite(params.angle, 0);
-
-    const mode: BlendMode =
-      params.blendMode === 'multiply' ||
-      params.blendMode === 'soft-light'
-        ? params.blendMode
-        : 'screen';
-
-    if (intensity <= 0 || radius <= 0) {
-      resultCtx.putImageData(output, 0, 0);
-      return result;
-    }
-
-    const [lightR, lightG, lightB, lightAlpha] =
-      this.parseColor(params.color);
-
-    if (lightAlpha <= 0) {
-      resultCtx.putImageData(output, 0, 0);
-      return result;
-    }
-
-    const sourcePixels = original.data;
-    const targetPixels = output.data;
-
-    // Calculate only pixels inside the light's bounds.
-    const radians = angle * Math.PI / 180;
-    const offset = radius * 0.25;
-
-    const centerX = x + Math.cos(radians) * offset;
-    const centerY = y + Math.sin(radians) * offset;
-
-    const minX = Math.max(
-      0,
-      Math.floor(centerX - radius)
-    );
-
-    const maxX = Math.min(
-      width - 1,
-      Math.ceil(centerX + radius)
-    );
-
-    const minY = Math.max(
-      0,
-      Math.floor(centerY - radius)
-    );
-
-    const maxY = Math.min(
-      height - 1,
-      Math.ceil(centerY + radius)
-    );
-
-    for (let py = minY; py <= maxY; py++) {
-      for (let px = minX; px <= maxX; px++) {
-        const index = (py * width + px) * 4;
-
-        const originalAlpha = sourcePixels[index + 3];
-
-        // Fully transparent pixels stay unchanged.
-        if (originalAlpha === 0) {
-          continue;
-        }
-
-        const falloff = this.calculateFalloff(
-          px + 0.5,
-          py + 0.5,
-          x,
-          y,
-          angle,
-          radius,
-          softness
-        );
-
-        const strength =
-          falloff * intensity * lightAlpha;
-
-        if (strength <= 0) {
-          continue;
-        }
-
-        const baseR = sourcePixels[index] / 255;
-        const baseG = sourcePixels[index + 1] / 255;
-        const baseB = sourcePixels[index + 2] / 255;
-
-        const blendedR = this.blendChannel(
-          baseR,
-          lightR,
-          mode
-        );
-
-        const blendedG = this.blendChannel(
-          baseG,
-          lightG,
-          mode
-        );
-
-        const blendedB = this.blendChannel(
-          baseB,
-          lightB,
-          mode
-        );
-
-        targetPixels[index] = Math.round(
-          this.clamp(
-            baseR + (blendedR - baseR) * strength,
-            0,
-            1
-          ) * 255
-        );
-
-        targetPixels[index + 1] = Math.round(
-          this.clamp(
-            baseG + (blendedG - baseG) * strength,
-            0,
-            1
-          ) * 255
-        );
-
-        targetPixels[index + 2] = Math.round(
-          this.clamp(
-            baseB + (blendedB - baseB) * strength,
-            0,
-            1
-          ) * 255
-        );
-
-        // Preserve the exact original alpha byte.
-        targetPixels[index + 3] = originalAlpha;
+    const resultCtx = result.getContext('2d', { willReadFrequently: true });
+    if (!resultCtx) throw new Error('LightingEngine: Cannot create output context.');
+    if (width === 0 || height === 0) return result;
+    const sourceCtx = source.getContext('2d', { willReadFrequently: true });
+    if (!sourceCtx) throw new Error('LightingEngine: Cannot read source context.');
+    const original = sourceCtx.getImageData(0, 0, width, height);
+    
+    let maskData: ImageData | null = null;
+    if (maskSource) {
+      const { width: maskW, height: maskH } = this.getSourceDimensions(maskSource);
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = maskW;
+      tempCanvas.height = maskH;
+      const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+      if (!tempCtx) throw new Error('LightingEngine: Cannot create mask context.');
+      try {
+        tempCtx.drawImage(maskSource, 0, 0, maskW, maskH);
+        maskData = tempCtx.getImageData(0, 0, maskW, maskH);
+      } catch (e) {
+        throw new Error('LightingEngine: Failed to rasterize mask: ' + (e as Error).message);
       }
     }
 
-    resultCtx.putImageData(output, 0, 0);
+    const output = new ImageData(new Uint8ClampedArray(original.data), width, height);
+    const intensity = this.clamp(this.finite(params.intensity, 0), 0, 1);
+    const softness = this.clamp(this.finite(params.softness, 0.5), 0, 1);
+    const radius = Math.max(1, this.finite(params.radius, 10));
+    const x = this.finite(params.x, width / 2);
+    const y = this.finite(params.y, height / 2);
+    const angle = this.finite(params.angle, 0);
+    const mode: BlendMode = params.blendMode === 'multiply' || params.blendMode === 'soft-light'
+      ? params.blendMode : 'screen';
+    const [lightR, lightG, lightB, lightAlpha] = this.parseColor(params.color);
+    if (intensity <= 0 || lightAlpha <= 0) {
+      resultCtx.putImageData(output, 0, 0);
+      return result;
+    }
 
+    const radians = (angle * Math.PI) / 180;
+    const cosA = Math.cos(radians);
+    const sinA = Math.sin(radians);
+
+    const sigmaMajor = radius;
+    const sigmaMinor = radius * (0.2 + 0.6 * (1 - softness));
+
+    const shadowX = x - cosA * radius * 0.5;
+    const shadowY = y - sinA * radius * 0.5;
+    const shadowSigmaMajor = sigmaMajor * 1.5;
+    const shadowSigmaMinor = sigmaMinor * 1.5;
+
+    const input = original.data;
+    const target = output.data;
+    const strengthScale = intensity * lightAlpha;
+
+    for (let py = 0; py < height; py++) {
+      for (let px = 0; px < width; px++) {
+        const index = (py * width + px) * 4;
+        if (input[index + 3] === 0) continue;
+        
+        const dx = px - x;
+        const dy = py - y;
+        
+        const u = dx * cosA + dy * sinA;
+        const v = -dx * sinA + dy * cosA;
+        const uAsym = u * (1 + 0.15 * this.clamp(u / radius, -1, 1));
+        const field = Math.exp(-0.5 * ((uAsym / sigmaMajor) ** 2 + (v / sigmaMinor) ** 2));
+
+        const baseR = input[index] / 255;
+        const baseG = input[index + 1] / 255;
+        const baseB = input[index + 2] / 255;
+
+        const luminance = 0.2126 * baseR + 0.7152 * baseG + 0.0722 * baseB;
+        const protect = 1 - this.smoothstep(this.clamp((luminance - 0.6) / 0.35, 0, 1));
+        const influence = strengthScale * field * protect;
+        
+        let litR = baseR;
+        let litG = baseG;
+        let litB = baseB;
+        
+        if (mode === 'screen') {
+          if (field > 0.001) {
+            const screenInfluence = this.clamp(influence * 1.2, 0, 1);
+            litR = baseR + (1 - baseR) * (screenInfluence * lightR);
+            litG = baseG + (1 - baseG) * (screenInfluence * lightG);
+            litB = baseB + (1 - baseB) * (screenInfluence * lightB);
+          }
+        } else if (mode === 'multiply') {
+          const litR_m = baseR * (1 - influence * (1 - lightR));
+          const litG_m = baseG * (1 - influence * (1 - lightG));
+          const litB_m = baseB * (1 - influence * (1 - lightB));
+          const dxSh = px - shadowX;
+          const dySh = py - shadowY;
+          const uSh = dxSh * cosA + dySh * sinA;
+          const vSh = -dxSh * sinA + dySh * cosA;
+          const shadowField = Math.exp(-0.5 * ((uSh / shadowSigmaMajor) ** 2 + (vSh / shadowSigmaMinor) ** 2));
+          const shadowMask = this.smoothstep(this.clamp(-u / (radius * 0.5), 0, 1));
+          const shadowStrength = this.clamp(strengthScale * shadowField * shadowMask * 0.2, 0, 0.2);
+          litR = litR_m * (1 - shadowStrength);
+          litG = litG_m * (1 - shadowStrength);
+          litB = litB_m * (1 - shadowStrength);
+        } else {
+          if (field > 0.001) {
+            const softInfluence = Math.pow(influence, 0.8);
+            litR = baseR + (this.blendChannel(baseR, lightR, 'soft-light') - baseR) * softInfluence;
+            litG = baseG + (this.blendChannel(baseG, lightG, 'soft-light') - baseG) * softInfluence;
+            litB = baseB + (this.blendChannel(baseB, lightB, 'soft-light') - baseB) * softInfluence;
+          }
+        }
+        
+        const maskU = ((px + 0.5) * (maskData ? maskData.width : 1) / width) - 0.5;
+        const maskV = ((py + 0.5) * (maskData ? maskData.height : 1) / height) - 0.5;
+        const weight = maskData ? this.sampleMask(maskData, maskU, maskV) : 1;
+
+        target[index] = Math.round(this.clamp(baseR + (litR - baseR) * weight, 0, 1) * 255);
+        target[index + 1] = Math.round(this.clamp(baseG + (litG - baseG) * weight, 0, 1) * 255);
+        target[index + 2] = Math.round(this.clamp(baseB + (litB - baseB) * weight, 0, 1) * 255);
+      }
+    }
+    resultCtx.putImageData(output, 0, 0);
     return result;
   }
 }

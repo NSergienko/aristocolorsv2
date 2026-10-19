@@ -224,12 +224,20 @@ export const StudioWorkspace: React.FC = () => {
   // Viewport transforms (Pan & Zoom)
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [activeTool, setActiveTool] = useState<'move' | 'pan' | 'brush'>('move');
+  const [activeTool, setActiveTool] = useState<'move' | 'pan' | 'brush' | 'marquee'>('move');
+  const [placingLight, setPlacingLight] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
   const panStartRef = useRef({ x: 0, y: 0 });
 
   // Move Tool: Layer dragging state
   const [isDraggingLayer, setIsDraggingLayer] = useState(false);
+  const [marqueeSelection, setMarqueeSelection] = useState<{
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+    active: boolean;
+  } | null>(null);
   const dragStartRef = useRef<{
     startX: number;
     startY: number;
@@ -635,11 +643,19 @@ export const StudioWorkspace: React.FC = () => {
 
       if (e.key === 'v' || e.key === 'V') {
         setActiveTool('move');
+        setMarqueeSelection(null);
       } else if (e.key === 'h' || e.key === 'H') {
         setActiveTool('pan');
+        setMarqueeSelection(null);
       } else if (e.key === 'b' || e.key === 'B') {
         setActiveTool('brush');
         setActiveEditTarget('mask');
+        setMarqueeSelection(null);
+      } else if (e.key === 'm' || e.key === 'M') {
+        setActiveTool('marquee');
+        setMarqueeSelection(null);
+      } else if (e.key === 'Escape') {
+        setMarqueeSelection(null);
       } else if (e.key === 'x' || e.key === 'X') {
         setBrushColor((c) => (c === 'black' ? 'white' : 'black'));
       } else if (e.key === '[') {
@@ -1552,11 +1568,36 @@ export const StudioWorkspace: React.FC = () => {
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
+    if (placingLight && e.button === 0 && doc && activeLayer && canvasRef.current && !activeLayer.locked) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const docX = (e.clientX - rect.left) / zoom;
+      const docY = (e.clientY - rect.top) / zoom;
+      if (docX >= 0 && docY >= 0 && docX <= doc.width && docY <= doc.height) {
+        const local = docToLayerCoords(docX, docY, activeLayer);
+        const w = activeLayer.sourceWidth ?? doc.width;
+        const h = activeLayer.sourceHeight ?? doc.height;
+        handleUpdateLighting({ x: Math.max(0, Math.min(w, local.x)), y: Math.max(0, Math.min(h, local.y)), enabled: true });
+        handleCommitLighting();
+        setPlacingLight(false);
+      }
+      e.preventDefault();
+      return;
+    }
+
     // 1. Pan the workspace if middle mouse button, pan tool, or Alt key
     if (e.button === 1 || activeTool === 'pan' || e.altKey) {
       e.preventDefault();
       setIsPanning(true);
       panStartRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
+      return;
+    }
+
+    // 1. Rectangular Marquee Tool (Left click)
+    if (e.button === 0 && activeTool === 'marquee' && canvasRef.current) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const startX = (e.clientX - rect.left) / zoom;
+      const startY = (e.clientY - rect.top) / zoom;
+      setMarqueeSelection({ startX, startY, currentX: startX, currentY: startY, active: true });
       return;
     }
 
@@ -1758,6 +1799,14 @@ export const StudioWorkspace: React.FC = () => {
   };
 
   const handleMouseMove = (e: React.MouseEvent | MouseEvent) => {
+    if (activeTool === 'marquee' && marqueeSelection?.active && canvasRef.current) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const currentX = (e.clientX - rect.left) / zoom;
+      const currentY = (e.clientY - rect.top) / zoom;
+      setMarqueeSelection(prev => prev ? {...prev, currentX, currentY} : prev);
+      return;
+    }
+
     if (activeTool === 'brush' && canvasRef.current) {
       const rect = canvasRef.current.getBoundingClientRect();
       setMouseCanvasPos({
@@ -1942,6 +1991,11 @@ export const StudioWorkspace: React.FC = () => {
   };
 
   const handleMouseUp = () => {
+    if (activeTool === 'marquee' && marqueeSelection?.active) {
+      setMarqueeSelection(prev => prev ? {...prev, active: false} : prev);
+      return;
+    }
+
     if (isPanning) {
       setIsPanning(false);
     }
@@ -2277,7 +2331,10 @@ export const StudioWorkspace: React.FC = () => {
         {/* Left Miniature Tool Shelf */}
         <div className="w-10 bg-[#131724] border-r border-[#293047] flex flex-col items-center py-2 gap-1.5 shrink-0 z-20">
           <button
-            onClick={() => setActiveTool('move')}
+            onClick={() => {
+              setActiveTool('move');
+              setMarqueeSelection(null);
+            }}
             className={`p-2 rounded-lg cursor-pointer transition-all ${
               activeTool === 'move'
                 ? 'bg-gradient-to-b from-[#8E24AA] to-[#7A1FA2] text-[#D7DEED] shadow-xs'
@@ -2289,7 +2346,22 @@ export const StudioWorkspace: React.FC = () => {
           </button>
           <button
             onClick={() => {
+              setActiveTool('marquee');
+              setMarqueeSelection(null);
+            }}
+            className={`p-2 rounded-lg cursor-pointer transition-all ${
+              activeTool === 'marquee'
+                ? 'bg-gradient-to-b from-[#8E24AA] to-[#7A1FA2] text-[#D7DEED] shadow-xs'
+                : 'text-[#8E9AB8] hover:text-[#D7DEED] hover:bg-[#171B29]'
+            }`}
+            title="Rectangular Marquee Tool"
+          >
+            <SquareDot className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => {
               setActiveTool('brush');
+              setMarqueeSelection(null);
               if (activeLayer?.mask) {
                 setActiveEditTarget('mask');
               }
@@ -2304,7 +2376,10 @@ export const StudioWorkspace: React.FC = () => {
             <Paintbrush className="w-4 h-4" />
           </button>
           <button
-            onClick={() => setActiveTool('pan')}
+            onClick={() => {
+              setActiveTool('pan');
+              setMarqueeSelection(null);
+            }}
             className={`p-2 rounded-lg cursor-pointer transition-all ${
               activeTool === 'pan'
                 ? 'bg-gradient-to-b from-[#8E24AA] to-[#7A1FA2] text-[#D7DEED] shadow-xs'
@@ -2503,6 +2578,7 @@ export const StudioWorkspace: React.FC = () => {
           {/* Subtle Stage Grid / Checkerboard Backdrop */}
           <div className="absolute inset-0 bg-canvas-checker opacity-40 pointer-events-none" />
 
+
           {/* Drag & drop overlay indicator */}
           {isDraggingOver && (
             <div className="absolute inset-4 rounded-2xl border-2 border-dashed border-[#BA68C8] bg-[#7A1FA2]/15 backdrop-blur-xs z-40 flex flex-col items-center justify-center gap-2 pointer-events-none">
@@ -2570,6 +2646,20 @@ export const StudioWorkspace: React.FC = () => {
             className="relative shadow-2xl shadow-black ring-1 ring-[#293047] bg-[#131724] shrink-0"
           >
             <canvas ref={canvasCallbackRef} className="block select-none pointer-events-none" />
+
+          {/* Marquee Selection Overlay */}
+          {marqueeSelection && (
+            <div
+              style={{
+                position: 'absolute',
+                left: `${Math.min(marqueeSelection.startX, marqueeSelection.currentX)}px`,
+                top: `${Math.min(marqueeSelection.startY, marqueeSelection.currentY)}px`,
+                width: `${Math.abs(marqueeSelection.currentX - marqueeSelection.startX)}px`,
+                height: `${Math.abs(marqueeSelection.currentY - marqueeSelection.startY)}px`,
+              }}
+              className="border-2 border-[#38BDF8] bg-[#38BDF8]/20 pointer-events-none z-30"
+            />
+          )}
 
             {/* Active Layer Visual Selection & Transform Box */}
             {activeLayer && activeLayer.visible && (
@@ -3266,13 +3356,12 @@ export const StudioWorkspace: React.FC = () => {
                       radius: Math.max(1, Math.round(Math.min(lw, lh) * 0.5)),
                       softness: 0.7, color: '#ffffff', blendMode: 'screen',
                     };
-                    const fields: { key: 'x' | 'y' | 'angle' | 'intensity' | 'radius' | 'softness'; label: string; min: number; max: number; step: number }[] = [
-                      { key: 'x', label: 'Light X', min: 0, max: lw, step: 1 },
-                      { key: 'y', label: 'Light Y', min: 0, max: lh, step: 1 },
-                      { key: 'angle', label: 'Direction', min: 0, max: 360, step: 1 },
-                      { key: 'intensity', label: 'Intensity', min: 0, max: 1, step: 0.01 },
-                      { key: 'radius', label: 'Radius', min: 0, max: Math.max(lw, lh) * 2, step: 1 },
-                      { key: 'softness', label: 'Softness', min: 0, max: 1, step: 0.01 },
+                    const imageAssets = Object.values(doc?.assets || {}).filter(a => a.mimeType.startsWith('image/'));
+                    const fields: { key: 'angle' | 'intensity' | 'radius' | 'softness'; label: string; min: number; max: number; step: number; format: (v: number) => string }[] = [
+                      { key: 'angle', label: 'Light direction', min: 0, max: 360, step: 1, format: v => `${Math.round(v)}°` },
+                      { key: 'intensity', label: 'Brightness', min: 0, max: 1, step: 0.01, format: v => `${Math.round(v * 100)}%` },
+                      { key: 'radius', label: 'Light spread', min: 1, max: Math.max(lw, lh) * 2, step: 1, format: v => `${Math.round(v / Math.max(lw, lh) * 100)}%` },
+                      { key: 'softness', label: 'Edge softness', min: 0, max: 1, step: 0.01, format: v => `${Math.round(v * 100)}%` },
                     ];
                     return (
                       <div className="pt-2.5 border-t border-[#293047] flex flex-col gap-3">
@@ -3280,16 +3369,22 @@ export const StudioWorkspace: React.FC = () => {
                           <span className="text-xs font-bold text-[#D7DEED]">Lighting</span>
                           <label className="flex items-center gap-2 text-[11px] text-[#8E9AB8]">
                             <input type="checkbox" checked={lighting.enabled} disabled={activeLayer.locked}
-                              onChange={(e) => { handleUpdateLighting({ enabled: e.target.checked }); handleCommitLighting(); }} />
-                            Enabled
+                              onChange={(e) => { handleUpdateLighting({ enabled: e.target.checked }); handleCommitLighting(); if (!e.target.checked) setPlacingLight(false); }} />
+                            On
                           </label>
                         </div>
-                        {fields.map(({ key, label, min, max, step }) => (
+                        <button type="button" disabled={activeLayer.locked}
+                          onClick={() => { setPlacingLight(true); handleUpdateLighting({ enabled: true }); }}
+                          className={`w-full py-2 rounded-md border text-xs ${placingLight ? 'bg-[#BA68C8] text-white border-[#BA68C8]' : 'bg-[#202438] border-[#414765] text-[#D7DEED]'}`}>
+                          {placingLight ? 'Click the image to place light…' : 'Place light on image'}
+                        </button>
+                        <div className="text-[10px] text-[#8E9AB8]">Click the image to position the light source.</div>
+                        {fields.map(({ key, label, min, max, step, format }) => (
                           <label key={key} className="flex flex-col gap-1 text-[11px] text-[#8E9AB8]">
-                            <span className="flex justify-between"><span>{label}</span><span className="font-mono text-[#D7DEED]">{Number(lighting[key].toFixed(2))}</span></span>
+                            <span className="flex justify-between"><span>{label}</span><span className="font-mono text-[#D7DEED]">{format(lighting[key])}</span></span>
                             <input type="range" min={min} max={max} step={step} value={lighting[key]}
                               disabled={activeLayer.locked}
-                              onChange={(e) => handleUpdateLighting({ [key]: Number(e.target.value) })}
+                              onChange={(e) => handleUpdateLighting({ [key]: Number(e.target.value), enabled: true })}
                               onPointerUp={handleCommitLighting} onKeyUp={handleCommitLighting}
                               className="w-full accent-[#BA68C8] cursor-pointer" />
                           </label>
@@ -3298,23 +3393,61 @@ export const StudioWorkspace: React.FC = () => {
                           Light color
                           <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(lighting.color) ? lighting.color : '#ffffff'}
                             disabled={activeLayer.locked}
-                            onChange={(e) => handleUpdateLighting({ color: e.target.value })}
+                            onChange={(e) => handleUpdateLighting({ color: e.target.value, enabled: true })}
                             onBlur={handleCommitLighting} className="w-12 h-7 cursor-pointer" />
                         </label>
                         <label className="flex flex-col gap-1 text-[11px] text-[#8E9AB8]">
-                          Lighting blend mode
+                          Lighting Mask
+                          <select
+                            value={lighting.maskAssetId || ""}
+                            disabled={activeLayer.locked}
+                            onChange={async (e) => {
+                              const maskAssetId = e.target.value || undefined;
+                              handleUpdateLighting({ maskAssetId });
+                              
+                              const updatedDoc = useDocumentStore.getState().document;
+                              if (updatedDoc) {
+                                try {
+                                  await saveDocument(updatedDoc);
+                                  setLastSavedTime(Date.now());
+                                  if (engineRef.current) {
+                                    engineRef.current.setDocument(updatedDoc);
+                                    engineRef.current.render();
+                                  }
+                                } catch (err) {
+                                  console.error('[StudioWorkspace] Error persisting lighting mask:', err);
+                                  addToast({
+                                    type: 'error',
+                                    title: 'Lighting Mask Save Failed',
+                                    message: 'Failed to persist lighting mask selection.',
+                                  });
+                                }
+                              }
+                            }}
+                            className="w-full bg-[#10131E] border border-[#293047] rounded-md px-2 py-1.5 text-xs text-[#D7DEED]"
+                          >
+                            <option value="">None</option>
+                            {imageAssets.filter(a => engineRef.current?.hasImageSource(a.id)).map((asset) => (
+                              <option key={asset.id} value={asset.id}>
+                                {asset.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="flex flex-col gap-1 text-[11px] text-[#8E9AB8]">
+                          Light interaction
                           <select value={lighting.blendMode} disabled={activeLayer.locked}
-                            onChange={(e) => { handleUpdateLighting({ blendMode: e.target.value as LayerLighting['blendMode'] }); handleCommitLighting(); }}
+                            onChange={(e) => { handleUpdateLighting({ blendMode: e.target.value as LayerLighting['blendMode'], enabled: true }); handleCommitLighting(); }}
                             className="w-full bg-[#10131E] border border-[#293047] rounded-md px-2 py-1.5 text-xs text-[#D7DEED]">
-                            <option value="screen">Screen</option>
-                            <option value="multiply">Multiply</option>
-                            <option value="soft-light">Soft Light</option>
+                            <option value="screen">Add light</option>
+                            <option value="multiply">Darken / shadow</option>
+                            <option value="soft-light">Subtle light</option>
                           </select>
                         </label>
                         <button type="button" disabled={activeLayer.locked}
                           onClick={() => { handleUpdateLighting({ enabled: false }); handleCommitLighting(); }}
                           className="w-full py-1.5 rounded-md bg-[#10131E] border border-[#293047] text-xs text-[#D7DEED] disabled:opacity-40">
-                          Disable Lighting
+                          Turn off lighting
                         </button>
                       </div>
                     );

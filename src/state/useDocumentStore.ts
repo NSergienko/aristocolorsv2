@@ -879,6 +879,11 @@ export const useDocumentStore = create<DocumentStore>()(
           layer.harmonization = patch.harmonization;
         }
 
+        // Apply non-destructive per-layer lighting settings.
+        if ('lighting' in patch) {
+          layer.lighting = patch.lighting;
+        }
+
         doc.updatedAt = Date.now();
       });
 
