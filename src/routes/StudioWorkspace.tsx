@@ -60,7 +60,9 @@ import type {
   LayerMask,
   LayerAdjustments,
   LayerLighting,
+  BoundingBox2D,
 } from '../types/DocumentModel.ts';
+import { copyRasterSelection } from '../lib/raster/RasterEditingAdapter.ts';
 import { CANVAS_BLEND_MODE_MAP } from '../engine/CanvasEngine.ts';
 import {
   CURVE_PRESETS,
@@ -90,6 +92,67 @@ const BLEND_MODES: { value: BlendMode; label: string }[] = [
   { value: 'color', label: 'Color' },
   { value: 'luminosity', label: 'Luminosity' },
 ];
+
+type StudioClipboard =
+  | { kind: 'pixels'; blob: Blob; bounds: BoundingBox2D; layerName: string }
+  | {
+      kind: 'layers';
+      rootId: string;
+      layerName: string;
+      layers: LayerNode[];
+      assets: { metadata: ProjectAsset; blob: Blob; bwBlob?: Blob }[];
+    };
+
+function clipboardLayerMatrix(layer: LayerNode): DOMMatrix {
+  const t = layer.transform;
+  const values = [t.x, t.y, t.scaleX, t.scaleY, t.rotation,
+    t.skewX ?? 0, t.skewY ?? 0, t.originX ?? 0, t.originY ?? 0];
+  if (!values.every(Number.isFinite)) throw new Error('Invalid layer transform.');
+  const ox = t.originX ?? 0;
+  const oy = t.originY ?? 0;
+  const skew = new DOMMatrix([
+    1, Math.tan((t.skewY ?? 0) * Math.PI / 180),
+    Math.tan((t.skewX ?? 0) * Math.PI / 180), 1, 0, 0,
+  ]);
+  return new DOMMatrix().translate(t.x, t.y).translate(ox, oy)
+    .rotate(t.rotation).multiply(skew).scale(t.scaleX, t.scaleY)
+    .translate(-ox, -oy);
+}
+
+function clipboardCanvas(width: number, height: number): HTMLCanvasElement {
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+    throw new Error('Invalid image dimensions.');
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
+function clipboardPng(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('PNG encoding failed.')), 'image/png');
+  });
+}
+
+async function clipboardDecode(blob: Blob): Promise<HTMLCanvasElement> {
+  const url = URL.createObjectURL(blob);
+  try {
+    const image = new Image();
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error('Image decoding failed.'));
+      image.src = url;
+    });
+    const canvas = clipboardCanvas(image.naturalWidth, image.naturalHeight);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas is unavailable.');
+    ctx.drawImage(image, 0, 0);
+    return canvas;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
 
 /**
  * Transforms canvas document coordinates into layer-local mask pixel coordinates,
@@ -238,6 +301,7 @@ export const StudioWorkspace: React.FC = () => {
     currentY: number;
     active: boolean;
   } | null>(null);
+
   const dragStartRef = useRef<{
     startX: number;
     startY: number;
@@ -283,6 +347,14 @@ export const StudioWorkspace: React.FC = () => {
 
   // Layer thumbnail previews cached as object URLs keyed by assetId
   const [assetThumbnails, setAssetThumbnails] = useState<Record<string, string>>({});
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const clipboardRef = useRef<StudioClipboard | null>(null);
+  const clipboardBusyRef = useRef(false);
+  const [hasClipboard, setHasClipboard] = useState(false);
+  const selectionForClipboardRef = useRef(marqueeSelection);
+  selectionForClipboardRef.current = marqueeSelection;
+
+  const handleCopyRef = useRef<(() => Promise<void>) | null>(null);
   const assetThumbnailsRef = useRef<Record<string, string>>({});
 
   // DOM References
@@ -623,6 +695,305 @@ export const StudioWorkspace: React.FC = () => {
     syncAssetsAndRender(doc);
   }, [doc, syncAssetsAndRender]);
 
+  useEffect(() => {
+    selectionForClipboardRef.current = null;
+    setMarqueeSelection(null);
+  }, [doc?.activeLayerId, activeProjectId]);
+
+
+  const handleClipboardOperation = useCallback(async (operation: 'copy' | 'cut' | 'paste') => {
+  if (clipboardBusyRef.current) {
+    addToast({ type: 'warning', title: 'Please wait', message: 'The previous clipboard operation is still running.' });
+    return;
+  }
+  clipboardBusyRef.current = true;
+  const store = useDocumentStore.getState();
+  const initialDoc = store.document;
+  const engine = engineRef.current;
+  let changed = false;
+  let finished = false;
+
+  const clearClipboard = () => {
+    clipboardRef.current = null;
+    setHasClipboard(false);
+  };
+  if (operation !== 'paste') clearClipboard();
+
+  try {
+    if (!initialDoc || !engine) throw new Error('Open a document first.');
+    const assertCurrent = (layers: LayerNode[] = []) => {
+      const current = useDocumentStore.getState().document;
+      if (!current || engineRef.current !== engine ||
+          current.assets !== initialDoc.assets || current.layers !== initialDoc.layers ||
+          layers.some(layer => current.layers[layer.id] !== layer)) {
+        throw new Error('The document changed during the operation. Try again.');
+      }
+      return current;
+    };
+    const publish = async () => {
+      const updated = useDocumentStore.getState().document;
+      if (!updated) throw new Error('Document is unavailable.');
+      changed = true;
+      engine.setDocument(updated);
+      engine.render();
+      await saveDocument(updated);
+      setLastSavedTime(Date.now());
+    };
+    const commit = (next: ProjectDocument) => {
+      next.updatedAt = Date.now();
+      if (!useDocumentStore.getState().setDocument(next)) {
+        throw new Error('Document validation rejected the operation.');
+      }
+      changed = true;
+    };
+
+    if (operation === 'paste') {
+      const copied = clipboardRef.current;
+      if (!copied) throw new Error('Copy or cut a layer or selection first.');
+      const newLayers: LayerNode[] = [];
+      const newAssets: ProjectAsset[] = [];
+      const sources = new Map<string, HTMLCanvasElement>();
+      let rootId: string;
+
+      if (copied.kind === 'pixels') {
+        const source = await clipboardDecode(copied.blob);
+        const assetId = `pasted-${crypto.randomUUID()}`;
+        await storeBinaryAsset(assetId, copied.blob);
+        newAssets.push({ id: assetId, name: copied.layerName, mimeType: 'image/png',
+          width: source.width, height: source.height, sizeBytes: copied.blob.size,
+          storageKey: assetId, createdAt: Date.now() });
+        sources.set(assetId, source);
+        rootId = `layer-${crypto.randomUUID()}`;
+        newLayers.push({ id: rootId, parentId: null, name: `Copy of ${copied.layerName}`,
+          type: 'raster', visible: true, locked: false, opacity: 1, blendMode: 'normal',
+          transform: { x: copied.bounds.x, y: copied.bounds.y, scaleX: 1, scaleY: 1,
+            rotation: 0, skewX: 0, skewY: 0, originX: 0, originY: 0 },
+          mask: null, sourceAssetId: assetId, sourceWidth: source.width, sourceHeight: source.height });
+      } else {
+        const assetIds = new Map<string, string>();
+        for (const asset of copied.assets) {
+          const id = `pasted-asset-${crypto.randomUUID()}`;
+          assetIds.set(asset.metadata.id, id);
+          await storeBinaryAsset(id, asset.blob);
+          if (asset.bwBlob) await storeBinaryAsset(`bw_${id}`, asset.bwBlob);
+          newAssets.push({ ...asset.metadata, id, storageKey: id, sizeBytes: asset.blob.size, createdAt: Date.now() });
+          sources.set(id, await clipboardDecode(asset.blob));
+        }
+        const layerIds = new Map(copied.layers.map(layer => [layer.id, `layer-${crypto.randomUUID()}`]));
+        rootId = layerIds.get(copied.rootId)!;
+        for (const original of copied.layers) {
+          const layer: LayerNode = structuredClone(original);
+          layer.id = layerIds.get(original.id)!;
+          layer.parentId = original.id === copied.rootId ? null : layerIds.get(original.parentId!)!;
+          if (layer.childrenIds) layer.childrenIds = layer.childrenIds.map(id => layerIds.get(id)!);
+          if (layer.sourceAssetId) layer.sourceAssetId = assetIds.get(layer.sourceAssetId)!;
+          if (layer.mask) layer.mask = { ...layer.mask, id: `mask-${crypto.randomUUID()}`,
+            maskAssetId: assetIds.get(layer.mask.maskAssetId)! };
+          if (original.id === copied.rootId) { layer.name = `Copy of ${layer.name}`; layer.locked = false; }
+          newLayers.push(layer);
+        }
+      }
+
+      const next = structuredClone(assertCurrent());
+      for (const asset of newAssets) next.assets[asset.id] = asset;
+      for (const layer of newLayers) next.layers[layer.id] = layer;
+      next.rootLayerIds.push(rootId);
+      next.activeLayerId = rootId;
+      next.selectedLayerIds = [rootId];
+      commit(next);
+      sources.forEach((source, id) => engine.registerImageSource(id, source));
+      selectionForClipboardRef.current = null;
+      setMarqueeSelection(null);
+      setActiveTool('move');
+      setActiveEditTarget('layer');
+      await publish();
+      finished = true;
+      addToast({ type: 'success', title: 'Pasted successfully', message: copied.layerName });
+      return;
+    }
+
+    const layer = initialDoc.activeLayerId ? initialDoc.layers[initialDoc.activeLayerId] : null;
+    if (!layer) throw new Error('Select a layer first.');
+    if (operation === 'cut' && store.isLayerLocked(layer.id)) throw new Error('Unlock the layer or its parent group first.');
+    const selection = selectionForClipboardRef.current;
+    if (selection?.active) throw new Error('Finish drawing the selection first.');
+
+    if (!selection) {
+      const ids = [layer.id, ...store.getDescendantIds(layer.id)];
+      const layers = ids.map(id => initialDoc.layers[id]);
+      if (operation === 'cut' && ids.some(id => store.isLayerLocked(id))) {
+        throw new Error('The group contains a locked layer.');
+      }
+      if (layer.parentId) throw new Error('Select the parent group to copy or cut it with its transform.');
+      const assetIds = new Set<string>();
+      const maskIds = new Set<string>();
+      layers.forEach(node => {
+        if (node.sourceAssetId) assetIds.add(node.sourceAssetId);
+        if (node.mask) { assetIds.add(node.mask.maskAssetId); maskIds.add(node.mask.maskAssetId); }
+      });
+      const assets: Extract<StudioClipboard, { kind: 'layers' }>['assets'] = [];
+      for (const id of assetIds) {
+        const metadata = initialDoc.assets[id];
+        if (!metadata) throw new Error('Layer asset metadata is missing.');
+        const liveMask = maskIds.has(id) ? maskCanvasesRef.current.get(id) : undefined;
+        let blob = liveMask ? await clipboardPng(liveMask) : await loadBinaryAsset(metadata.storageKey || id);
+        if (!blob) {
+          const source = engine.getImageSource(id);
+          if (!source) throw new Error(`Asset is unavailable: ${metadata.name}`);
+          const canvas = clipboardCanvas(metadata.width, metadata.height);
+          const ctx = canvas.getContext('2d');
+          if (!ctx) throw new Error('Canvas is unavailable.');
+          ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+          blob = await clipboardPng(canvas);
+        }
+        let bwBlob: Blob | undefined;
+        if (maskIds.has(id)) {
+          const bw = await clipboardDecode(blob);
+          const bwCtx = bw.getContext('2d');
+          if (!bwCtx) throw new Error('Canvas is unavailable.');
+          const pixels = bwCtx.getImageData(0, 0, bw.width, bw.height);
+          for (let i = 0; i < pixels.data.length; i += 4) {
+            pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = pixels.data[i + 3];
+            pixels.data[i + 3] = 255;
+          }
+          bwCtx.putImageData(pixels, 0, 0);
+          bwBlob = await clipboardPng(bw);
+        }
+        const mimeType: ProjectAsset['mimeType'] = blob.type === 'image/jpeg' ? 'image/jpeg'
+          : blob.type === 'image/webp' ? 'image/webp'
+          : blob.type === 'image/svg+xml' ? 'image/svg+xml' : 'image/png';
+        assets.push({ metadata: { ...metadata, mimeType }, blob, bwBlob });
+      }
+      assertCurrent(layers);
+      const payload: StudioClipboard = { kind: 'layers', rootId: layer.id,
+        layerName: layer.name, layers: structuredClone(layers), assets };
+      if (operation === 'cut') {
+        if (!useDocumentStore.getState().removeLayer(layer.id)) throw new Error('The layer could not be cut.');
+        clipboardRef.current = payload;
+        setHasClipboard(true);
+        await publish();
+      } else {
+        clipboardRef.current = payload;
+        setHasClipboard(true);
+      }
+    } else {
+      if (layer.parentId) throw new Error('Selection editing of nested layers requires their parent transform. Select a root image layer.');
+      if (layer.type !== 'raster' && layer.type !== 'harmonized_clone') throw new Error('Select a raster layer to edit pixels.');
+      if (!layer.sourceAssetId) throw new Error('The layer has no image.');
+      const bounds: BoundingBox2D = { x: Math.min(selection.startX, selection.currentX),
+        y: Math.min(selection.startY, selection.currentY), width: Math.abs(selection.currentX - selection.startX),
+        height: Math.abs(selection.currentY - selection.startY) };
+      if (!Object.values(bounds).every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) {
+        throw new Error('Draw a non-empty selection, or press Escape to work with the whole layer.');
+      }
+      const image = engine.getImageSource(layer.sourceAssetId);
+      if (!image) throw new Error('The source image has not loaded.');
+      const w = layer.sourceWidth;
+      const h = layer.sourceHeight;
+      if (!w || !h) throw new Error('Invalid layer dimensions.');
+      const maskCanvas = clipboardCanvas(w, h);
+      const ctx = maskCanvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas is unavailable.');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, w, h);
+      if (layer.mask?.isEnabled) {
+        let source: CanvasImageSource | undefined = maskCanvasesRef.current.get(layer.mask.maskAssetId) || engine.getImageSource(layer.mask.maskAssetId);
+        if (!source) {
+          const asset = initialDoc.assets[layer.mask.maskAssetId];
+          const blob = await loadBinaryAsset(asset?.storageKey || layer.mask.maskAssetId);
+          if (!blob) throw new Error('The existing mask is unavailable.');
+          source = await clipboardDecode(blob);
+        }
+        ctx.globalCompositeOperation = layer.mask.isInverted ? 'destination-out' : 'destination-in';
+        ctx.drawImage(source, 0, 0, w, h);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+      const normalized: LayerNode = { ...layer, mask: layer.mask?.isEnabled
+        ? { ...layer.mask, isInverted: false, density: 1 } : null };
+      const result = await copyRasterSelection(normalized, bounds, image, normalized.mask ? maskCanvas : undefined);
+      const output = await clipboardDecode(result.blob);
+      const outputCtx = output.getContext('2d');
+      if (!outputCtx) throw new Error('Canvas is unavailable.');
+      const alpha = outputCtx.getImageData(0, 0, output.width, output.height).data;
+      let hasPixels = false;
+      for (let i = 3; i < alpha.length; i += 4) if (alpha[i]) { hasPixels = true; break; }
+      if (!hasPixels) throw new Error('The selection contains no visible pixels of the active layer.');
+      const payload: StudioClipboard = { kind: 'pixels', ...result, layerName: layer.name };
+
+      if (operation === 'cut') {
+        const matrix = clipboardLayerMatrix(layer);
+        const determinant = matrix.a * matrix.d - matrix.b * matrix.c;
+        if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) throw new Error('The layer transform is not invertible.');
+        const inverse = matrix.inverse();
+        const points = [[bounds.x, bounds.y], [bounds.x + bounds.width, bounds.y],
+          [bounds.x + bounds.width, bounds.y + bounds.height], [bounds.x, bounds.y + bounds.height]]
+          .map(([x, y]) => inverse.transformPoint({ x, y }));
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        points.slice(1).forEach(point => ctx.lineTo(point.x, point.y));
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalCompositeOperation = 'source-over';
+        const blob = await clipboardPng(maskCanvas);
+        const bwCanvas = clipboardCanvas(w, h);
+        const bwCtx = bwCanvas.getContext('2d');
+        if (!bwCtx) throw new Error('Canvas is unavailable.');
+        const data = ctx.getImageData(0, 0, w, h);
+        for (let i = 0; i < data.data.length; i += 4) {
+          data.data[i] = data.data[i + 1] = data.data[i + 2] = data.data[i + 3];
+          data.data[i + 3] = 255;
+        }
+        bwCtx.putImageData(data, 0, 0);
+        const id = `cut-mask-${crypto.randomUUID()}`;
+        await storeBinaryAsset(id, blob);
+        await storeBinaryAsset(`bw_${id}`, await clipboardPng(bwCanvas));
+        const current = assertCurrent([layer]);
+        if (useDocumentStore.getState().isLayerLocked(layer.id)) throw new Error('The layer is locked.');
+        const next = structuredClone(current);
+        next.assets[id] = { id, name: `${layer.name} Mask`, mimeType: 'image/png', width: w, height: h,
+          sizeBytes: blob.size, storageKey: id, createdAt: Date.now() };
+        next.layers[layer.id].mask = { id: `mask-${crypto.randomUUID()}`, maskAssetId: id,
+          width: w, height: h, isEnabled: true, isLinked: true, isInverted: false,
+          isClamping: true, feather: 0, density: 1 };
+        commit(next);
+        engine.registerImageSource(id, maskCanvas);
+        maskCanvasesRef.current.set(id, maskCanvas);
+        setMaskPreviews(previous => ({ ...previous, [id]: maskCanvas.toDataURL('image/png') }));
+        clipboardRef.current = payload;
+        setHasClipboard(true);
+        selectionForClipboardRef.current = null;
+        setMarqueeSelection(null);
+        await publish();
+      } else {
+        assertCurrent([layer]);
+        clipboardRef.current = payload;
+        setHasClipboard(true);
+      }
+    }
+    finished = true;
+    addToast({ type: 'success', title: operation === 'cut' ? 'Cut successfully' : 'Copied successfully', message: layer.name });
+  } catch (error) {
+    if (!changed && operation !== 'paste') clearClipboard();
+    addToast({ type: 'error', title: changed ? 'Changed, but save failed' : `${operation} failed`,
+      message: error instanceof Error ? error.message : 'Clipboard operation failed.' });
+    console.error('[StudioWorkspace] Clipboard:', error);
+  } finally {
+    clipboardBusyRef.current = false;
+    if (changed && !finished) console.warn('[StudioWorkspace] Save the document again before closing.');
+  }
+}, [addToast, setActiveTool, setActiveEditTarget, setMarqueeSelection]);
+
+const handleCopy = useCallback(() => handleClipboardOperation('copy'), [handleClipboardOperation]);
+const handleCut = useCallback(() => handleClipboardOperation('cut'), [handleClipboardOperation]);
+const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handleClipboardOperation]);
+
+
+
+  useEffect(() => {
+    handleCopyRef.current = handleCopy;
+  }, [handleCopy]);
+
   // Keyboard tool switching: V for Move, H for Hand/Pan
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -630,7 +1001,8 @@ export const StudioWorkspace: React.FC = () => {
       if (
         activeEl instanceof HTMLInputElement ||
         activeEl instanceof HTMLTextAreaElement ||
-        activeEl instanceof HTMLSelectElement
+        activeEl instanceof HTMLSelectElement ||
+        (activeEl instanceof HTMLElement && activeEl.isContentEditable)
       ) {
         return;
       }
@@ -641,22 +1013,40 @@ export const StudioWorkspace: React.FC = () => {
         return;
       }
 
-      if (e.key === 'v' || e.key === 'V') {
+      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC') {
+        e.preventDefault();
+        handleCopyRef.current?.();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
+        e.preventDefault();
+        handlePaste();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.code === 'KeyX') {
+        e.preventDefault();
+        handleCut();
+        return;
+      }
+      
+      if (e.code === 'KeyV') {
         setActiveTool('move');
         setMarqueeSelection(null);
-      } else if (e.key === 'h' || e.key === 'H') {
+      } else if (e.code === 'KeyH') {
         setActiveTool('pan');
         setMarqueeSelection(null);
-      } else if (e.key === 'b' || e.key === 'B') {
+      } else if (e.code === 'KeyB') {
         setActiveTool('brush');
         setActiveEditTarget('mask');
         setMarqueeSelection(null);
-      } else if (e.key === 'm' || e.key === 'M') {
+      } else if (e.code === 'KeyM') {
         setActiveTool('marquee');
         setMarqueeSelection(null);
       } else if (e.key === 'Escape') {
         setMarqueeSelection(null);
-      } else if (e.key === 'x' || e.key === 'X') {
+      } else if (e.code === 'KeyX') {
         setBrushColor((c) => (c === 'black' ? 'white' : 'black'));
       } else if (e.key === '[') {
         setBrushSize((s) => Math.max(5, s - 5));
@@ -667,7 +1057,9 @@ export const StudioWorkspace: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [handleCopy, handlePaste, handleCut]);
+
+
 
   // --------------------------------------------------------------------------
   // 5. Image & Background Plate Ingestion Pipeline
@@ -1718,58 +2110,65 @@ export const StudioWorkspace: React.FC = () => {
       const clickDocX = (e.clientX - rect.left) / zoom;
       const clickDocY = (e.clientY - rect.top) / zoom;
 
-      // Reverse order: topmost layers checked first for hit-testing
-      const reversedLayers = [...doc.rootLayerIds]
-        .reverse()
-        .map((id) => doc.layers[id])
-        .filter(Boolean);
-
+      const currentDoc = useDocumentStore.getState().document;
+      if (!currentDoc) return;
       let hitLayer: LayerNode | null = null;
-      for (const l of reversedLayers) {
-        if (!l.visible) continue;
-        const lx = l.transform.x;
-        const ly = l.transform.y;
-        const lw = (l.sourceWidth ?? doc.width) * (l.transform.scaleX ?? 1);
-        const lh = (l.sourceHeight ?? doc.height) * (l.transform.scaleY ?? 1);
-        if (clickDocX >= lx && clickDocX <= lx + lw && clickDocY >= ly && clickDocY <= ly + lh) {
-          hitLayer = l;
-          break;
+      for (const id of [...currentDoc.rootLayerIds].reverse()) {
+        const candidate = currentDoc.layers[id];
+        if (!candidate || !candidate.visible || candidate.opacity <= 0 || candidate.type === 'group') continue;
+        const matrix = clipboardLayerMatrix(candidate);
+        const determinant = matrix.a * matrix.d - matrix.b * matrix.c;
+        if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) continue;
+        const local = matrix.inverse().transformPoint({ x: clickDocX, y: clickDocY });
+        const width = candidate.sourceWidth ?? currentDoc.width;
+        const height = candidate.sourceHeight ?? currentDoc.height;
+        if (local.x < 0 || local.y < 0 || local.x >= width || local.y >= height) continue;
+        const source = candidate.sourceAssetId ? engineRef.current?.getImageSource(candidate.sourceAssetId) : undefined;
+        let alpha = 255;
+        if (source) {
+          const sample = document.createElement('canvas');
+          sample.width = sample.height = 1;
+          const ctx = sample.getContext('2d', { willReadFrequently: true });
+          if (!ctx) continue;
+          try {
+            // Drawing the entire scaled source avoids assumptions about bitmap dimensions.
+            ctx.drawImage(source, -local.x, -local.y, width, height);
+            alpha = ctx.getImageData(0, 0, 1, 1).data[3];
+            if (candidate.mask?.isEnabled) {
+              const mask = maskCanvasesRef.current.get(candidate.mask.maskAssetId) ||
+                engineRef.current?.getImageSource(candidate.mask.maskAssetId);
+              if (!mask) continue;
+              ctx.clearRect(0, 0, 1, 1);
+              ctx.drawImage(mask, -local.x, -local.y, width, height);
+              const maskAlpha = ctx.getImageData(0, 0, 1, 1).data[3] / 255;
+              alpha *= candidate.mask.isInverted ? 1 - maskAlpha : maskAlpha;
+            }
+          } catch {
+            // If alpha is unreadable, use geometric hit-testing for this layer.
+            alpha = 255;
+          }
         }
+        if (alpha <= 0) continue;
+        hitLayer = candidate;
+        break;
       }
 
-      let targetLayer: LayerNode | null = null;
-      if (activeLayer && !activeLayer.locked) {
-        const alx = activeLayer.transform.x;
-        const aly = activeLayer.transform.y;
-        const alw = (activeLayer.sourceWidth ?? doc.width) * (activeLayer.transform.scaleX ?? 1);
-        const alh = (activeLayer.sourceHeight ?? doc.height) * (activeLayer.transform.scaleY ?? 1);
-        const isClickInActive =
-          clickDocX >= alx && clickDocX <= alx + alw && clickDocY >= aly && clickDocY <= aly + alh;
-
-        if (isClickInActive) {
-          targetLayer = activeLayer;
-        } else if (hitLayer && !hitLayer.locked) {
-          targetLayer = hitLayer;
-          setStoreActiveLayer(hitLayer.id);
-        } else {
-          targetLayer = activeLayer;
-        }
-      } else if (hitLayer && !hitLayer.locked) {
-        targetLayer = hitLayer;
-        setStoreActiveLayer(hitLayer.id);
+      if (currentDoc.activeLayerId !== (hitLayer?.id ?? null)) {
+        selectionForClipboardRef.current = null;
+        setMarqueeSelection(null);
       }
+      setStoreActiveLayer(hitLayer?.id ?? null);
+      if (!hitLayer) return;
+      setActiveEditTarget('layer');
+      if (useDocumentStore.getState().isLayerLocked(hitLayer.id)) return;
+      e.preventDefault();
+      setIsDraggingLayer(true);
+      dragStartRef.current = {
+        startX: e.clientX, startY: e.clientY,
+        layerStartX: hitLayer.transform.x, layerStartY: hitLayer.transform.y,
+        layerId: hitLayer.id,
+      };
 
-      if (targetLayer && !targetLayer.locked) {
-        e.preventDefault();
-        setIsDraggingLayer(true);
-        dragStartRef.current = {
-          startX: e.clientX,
-          startY: e.clientY,
-          layerStartX: targetLayer.transform.x,
-          layerStartY: targetLayer.transform.y,
-          layerId: targetLayer.id,
-        };
-      }
     }
   };
 
@@ -1990,9 +2389,16 @@ export const StudioWorkspace: React.FC = () => {
     }
   };
 
-  const handleMouseUp = () => {
+  const handleMouseUp = (e?: MouseEvent | React.MouseEvent) => {
     if (activeTool === 'marquee' && marqueeSelection?.active) {
-      setMarqueeSelection(prev => prev ? {...prev, active: false} : prev);
+      if (e && canvasRef.current) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        const currentX = (e.clientX - rect.left) / zoom;
+        const currentY = (e.clientY - rect.top) / zoom;
+        setMarqueeSelection(prev => prev ? { ...prev, currentX, currentY, active: false } : prev);
+      } else {
+        setMarqueeSelection(prev => prev ? { ...prev, active: false } : prev);
+      }
       return;
     }
 
@@ -2108,14 +2514,14 @@ export const StudioWorkspace: React.FC = () => {
 
   // Global window listeners for drag, resize & paint to prevent stuttering when mouse moves quickly
   useEffect(() => {
-    if (!isResizingLayer && !isDraggingLayer && !isPainting) return;
+    if (!isResizingLayer && !isDraggingLayer && !isPainting && !(activeTool === 'marquee' && marqueeSelection?.active)) return;
 
     const onWindowMouseMove = (e: MouseEvent) => {
       handleMouseMove(e);
     };
 
-    const onWindowMouseUp = () => {
-      handleMouseUp();
+    const onWindowMouseUp = (e: MouseEvent) => {
+      handleMouseUp(e);
     };
 
     window.addEventListener('mousemove', onWindowMouseMove);
@@ -2124,11 +2530,16 @@ export const StudioWorkspace: React.FC = () => {
       window.removeEventListener('mousemove', onWindowMouseMove);
       window.removeEventListener('mouseup', onWindowMouseUp);
     };
-  }, [isResizingLayer, isDraggingLayer, isPainting]);
+  }, [isResizingLayer, isDraggingLayer, isPainting, activeTool, marqueeSelection?.active, zoom]);
 
   // --------------------------------------------------------------------------
   // 10. Drag & Drop Image Handlers
   // --------------------------------------------------------------------------
+  
+
+  // 10. Drag & Drop Image Handlers
+  // --------------------------------------------------------------------------
+  
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -2644,7 +3055,9 @@ export const StudioWorkspace: React.FC = () => {
               transition: isPanning || isDraggingLayer || isResizingLayer ? 'none' : 'transform 0.05s ease-out',
             }}
             className="relative shadow-2xl shadow-black ring-1 ring-[#293047] bg-[#131724] shrink-0"
+            onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setContextMenu({ x: e.clientX, y: e.clientY }); }}
           >
+
             <canvas ref={canvasCallbackRef} className="block select-none pointer-events-none" />
 
           {/* Marquee Selection Overlay */}
@@ -2788,6 +3201,38 @@ export const StudioWorkspace: React.FC = () => {
           </div>
         </div>
 
+        {/* Context menu positioned correctly outside container */}
+        {contextMenu && (
+          <div
+            className="absolute z-50 bg-[#202638] border border-[#55617d] shadow-xl rounded text-sm text-white"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+            onMouseDown={(e) => e.stopPropagation()}
+            onMouseUp={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); setContextMenu(null); }}
+          >
+            <button
+              className="px-4 py-2 hover:bg-[#35415c] text-white w-full text-left"
+              onClick={() => { handleCopy(); setContextMenu(null); }}
+            >
+              Copy
+            </button>
+            <button
+              className="px-4 py-2 hover:bg-[#35415c] text-white w-full text-left"
+              onClick={() => { handleCut(); setContextMenu(null); }}
+            >
+              Cut
+            </button>
+            {clipboardRef.current && (
+              <button
+                className="px-4 py-2 hover:bg-[#35415c] text-white w-full text-left"
+                onClick={() => { handlePaste(); setContextMenu(null); }}
+              >
+                Paste
+              </button>
+            )}
+          </div>
+        )}
+
         {/* ------------------------------------------------------------------ */}
         {/* 3. Right Sidebar: Layers & Layer Properties */}
         {/* ------------------------------------------------------------------ */}
@@ -2880,6 +3325,10 @@ export const StudioWorkspace: React.FC = () => {
                       <div
                         key={layer.id}
                         onClick={() => {
+                          if (useDocumentStore.getState().document?.activeLayerId !== layer.id) {
+                            selectionForClipboardRef.current = null;
+                            setMarqueeSelection(null);
+                          }
                           setStoreActiveLayer(layer.id);
                           if (!layer.mask && activeEditTarget === 'mask') {
                             setActiveEditTarget('layer');

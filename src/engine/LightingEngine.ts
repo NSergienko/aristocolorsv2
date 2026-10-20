@@ -88,9 +88,12 @@ export class LightingEngine {
     } else if (source instanceof HTMLVideoElement) {
       width = source.videoWidth;
       height = source.videoHeight;
-    } else if (source instanceof HTMLImageElement || (typeof SVGImageElement !== 'undefined' && source instanceof SVGImageElement)) {
+    } else if (source instanceof HTMLImageElement) {
       width = source.naturalWidth;
       height = source.naturalHeight;
+    } else if (typeof SVGImageElement !== 'undefined' && source instanceof SVGImageElement) {
+      width = source.width.baseVal.value;
+      height = source.height.baseVal.value;
     } else if (typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap) {
       width = source.width;
       height = source.height;
