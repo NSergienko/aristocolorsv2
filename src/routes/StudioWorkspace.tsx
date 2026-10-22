@@ -33,6 +33,7 @@ import {
   ChevronDown,
   Sparkles,
   BookmarkPlus,
+  Stamp,
   Loader2,
 } from 'lucide-react';
 import { useShell } from '../shell/ShellContext.tsx';
@@ -253,6 +254,77 @@ function paintMaskStroke(
   ctx.restore();
 }
 
+/**
+ * Paints a clone stamp stroke.
+ */
+function paintCloneStampStroke(
+  ctx: CanvasRenderingContext2D,
+  sourceSnapshot: CanvasImageSource,
+  fromX: number, fromY: number, toX: number, toY: number,
+  offsetX: number, offsetY: number,
+  radius: number, hardness: number, opacity: number
+): void {
+  if (![fromX, fromY, toX, toY, offsetX, offsetY, radius, hardness, opacity].every(Number.isFinite) || radius <= 0) return;
+  const strength = Math.max(0, Math.min(1, opacity));
+  if (strength === 0) return;
+  const hard = Math.max(0, Math.min(1, hardness));
+  const diameter = Math.ceil(radius * 2);
+  const tip = clipboardCanvas(diameter, diameter);
+  const tipCtx = tip.getContext('2d');
+  const tipMask = clipboardCanvas(diameter, diameter);
+  const maskCtx = tipMask.getContext('2d');
+  if (!tipCtx || !maskCtx) throw new Error('Could not create the clone brush.');
+  if (hard < 1) {
+    const gradient = maskCtx.createRadialGradient(radius, radius, radius * hard, radius, radius, radius);
+    gradient.addColorStop(0, 'rgba(255,255,255,1)');
+    gradient.addColorStop(1, 'rgba(255,255,255,0)');
+    maskCtx.fillStyle = gradient;
+  } else {
+    maskCtx.fillStyle = '#ffffff';
+  }
+  maskCtx.beginPath();
+  maskCtx.arc(radius, radius, radius, 0, Math.PI * 2);
+  maskCtx.fill();
+  const distance = Math.hypot(toX - fromX, toY - fromY);
+  const steps = Math.max(1, Math.ceil(distance / Math.max(0.5, radius * 0.2)));
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = strength;
+  try {
+    // The first dab is applied on mousedown; subsequent segments skip it.
+    for (let i = distance === 0 ? 0 : 1; i <= (distance === 0 ? 0 : steps); i++) {
+      const t = distance === 0 ? 0 : i / steps;
+      const x = fromX + (toX - fromX) * t;
+      const y = fromY + (toY - fromY) * t;
+      tipCtx.clearRect(0, 0, diameter, diameter);
+      tipCtx.globalCompositeOperation = 'source-over';
+      tipCtx.drawImage(sourceSnapshot, radius - x + offsetX, radius - y + offsetY);
+      tipCtx.globalCompositeOperation = 'destination-in';
+      tipCtx.drawImage(tipMask, 0, 0);
+      tipCtx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(tip, x - radius, y - radius);
+    }
+  } finally {
+    ctx.restore();
+  }
+}
+
+type CloneStampStroke = {
+  documentId: string;
+  projectId: string | null;
+  layer: LayerNode;
+  engine: CanvasEngine;
+  snapshot: HTMLCanvasElement;
+  working: HTMLCanvasElement;
+  previewDocument: ProjectDocument;
+  previewId: string;
+  inverse: DOMMatrix;
+  offsetX: number;
+  offsetY: number;
+  last: { x: number; y: number };
+  settings: { size: number; hardness: number; opacity: number };
+};
+
 export const StudioWorkspace: React.FC = () => {
   const {
     activeProjectId,
@@ -287,7 +359,7 @@ export const StudioWorkspace: React.FC = () => {
   // Viewport transforms (Pan & Zoom)
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [activeTool, setActiveTool] = useState<'move' | 'pan' | 'brush' | 'marquee'>('move');
+  const [activeTool, setActiveTool] = useState<'move' | 'pan' | 'brush' | 'marquee' | 'lasso' | 'cloneStamp'>('move');
   const [placingLight, setPlacingLight] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
   const panStartRef = useRef({ x: 0, y: 0 });
@@ -300,6 +372,15 @@ export const StudioWorkspace: React.FC = () => {
     currentX: number;
     currentY: number;
     active: boolean;
+  } | null>(null);
+  const [lassoMode, setLassoMode] =
+    useState<'freehand' | 'polygonal'>('freehand');
+  const [feather, setFeather] = useState(3);
+
+  const [lassoSelection, setLassoSelection] = useState<{
+    points: { x: number; y: number }[];
+    active: boolean;
+    type: 'freehand' | 'polygonal';
   } | null>(null);
 
   const dragStartRef = useRef<{
@@ -333,10 +414,18 @@ export const StudioWorkspace: React.FC = () => {
   const [brushSize, setBrushSize] = useState<number>(50);
   const [brushHardness, setBrushHardness] = useState<number>(0.8);
   const [isPainting, setIsPainting] = useState(false);
+  const [cloneStampSource, setCloneStampSource] = useState<{ x: number; y: number; layerId: string } | null>(null);
+  const [cloneStampSettings, setCloneStampSettings] = useState({ size: 50, hardness: 0.8, opacity: 1 });
   const lastPaintPosRef = useRef<{ x: number; y: number } | null>(null);
   const maskCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const [maskPreviews, setMaskPreviews] = useState<Record<string, string>>({});
   const [mouseCanvasPos, setMouseCanvasPos] = useState<{ x: number; y: number } | null>(null);
+  const cloneStampStrokeRef = useRef<CloneStampStroke | null>(null);
+  const cloneStampSavingRef = useRef(false);
+  const cloneStampCancelRef = useRef<() => void>(() => {});
+  const [cloneStampSaving, setCloneStampSaving] = useState(false);
+  const cloneStampContextRef = useRef({ projectId: activeProjectId ?? null, layerId: activeLayer?.id, tool: activeTool });
+  cloneStampContextRef.current = { projectId: activeProjectId ?? null, layerId: activeLayer?.id, tool: activeTool };
 
   // Universal Layer Mask Editor Modal State (react-canvas-masker)
   const [isMaskModalOpen, setIsMaskModalOpen] = useState<boolean>(false);
@@ -702,6 +791,10 @@ export const StudioWorkspace: React.FC = () => {
 
 
   const handleClipboardOperation = useCallback(async (operation: 'copy' | 'cut' | 'paste') => {
+  if (cloneStampStrokeRef.current || cloneStampSavingRef.current) {
+    addToast({ type: 'warning', title: 'Clone Stamp', message: 'Finish the clone stroke before using the clipboard.' });
+    return;
+  }
   if (clipboardBusyRef.current) {
     addToast({ type: 'warning', title: 'Please wait', message: 'The previous clipboard operation is still running.' });
     return;
@@ -816,9 +909,20 @@ export const StudioWorkspace: React.FC = () => {
     if (!layer) throw new Error('Select a layer first.');
     if (operation === 'cut' && store.isLayerLocked(layer.id)) throw new Error('Unlock the layer or its parent group first.');
     const selection = selectionForClipboardRef.current;
-    if (selection?.active) throw new Error('Finish drawing the selection first.');
+    const lasso = lassoSelection;
+    const isLasso = !!lasso;
+    if (lasso) {
+      if (lasso.active) throw new Error('Finish drawing the lasso first.');
+      if (lasso.points.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y))) {
+        throw new Error('Lasso contains invalid coordinates.');
+      }
+      const distinctPoints = new Set(lasso.points.map(point => `${point.x},${point.y}`));
+      if (distinctPoints.size < 3) throw new Error('Draw a lasso with at least three different points.');
+    } else if (selection?.active) {
+      throw new Error('Finish drawing the selection first.');
+    }
 
-    if (!selection) {
+    if (!selection && !isLasso) {
       const ids = [layer.id, ...store.getDescendantIds(layer.id)];
       const layers = ids.map(id => initialDoc.layers[id]);
       if (operation === 'cut' && ids.some(id => store.isLayerLocked(id))) {
@@ -880,22 +984,49 @@ export const StudioWorkspace: React.FC = () => {
       if (layer.parentId) throw new Error('Selection editing of nested layers requires their parent transform. Select a root image layer.');
       if (layer.type !== 'raster' && layer.type !== 'harmonized_clone') throw new Error('Select a raster layer to edit pixels.');
       if (!layer.sourceAssetId) throw new Error('The layer has no image.');
-      const bounds: BoundingBox2D = { x: Math.min(selection.startX, selection.currentX),
-        y: Math.min(selection.startY, selection.currentY), width: Math.abs(selection.currentX - selection.startX),
-        height: Math.abs(selection.currentY - selection.startY) };
+
+      let bounds: BoundingBox2D;
+      const w = layer.sourceWidth!;
+      const h = layer.sourceHeight!;
+      if (!w || !h) throw new Error('Invalid layer dimensions.');
+
+      const featherRadius = lasso && Number.isFinite(feather)
+        ? Math.max(0, Math.min(20, feather)) : 0;
+      const featherPadding = Math.ceil(3 * featherRadius);
+      if (lasso) {
+        let left = Infinity;
+        let top = Infinity;
+        let right = -Infinity;
+        let bottom = -Infinity;
+        for (const point of lasso.points) {
+          left = Math.min(left, point.x);
+          top = Math.min(top, point.y);
+          right = Math.max(right, point.x);
+          bottom = Math.max(bottom, point.y);
+        }
+        left = Math.floor(left) - featherPadding;
+        top = Math.floor(top) - featherPadding;
+        right = Math.ceil(right) + featherPadding;
+        bottom = Math.ceil(bottom) + featherPadding;
+        bounds = { x: left, y: top, width: right - left, height: bottom - top };
+      } else {
+        if (!selection) throw new Error('No selection is available.');
+        bounds = { x: Math.min(selection.startX, selection.currentX),
+          y: Math.min(selection.startY, selection.currentY), width: Math.abs(selection.currentX - selection.startX),
+          height: Math.abs(selection.currentY - selection.startY) };
+      }
       if (!Object.values(bounds).every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) {
         throw new Error('Draw a non-empty selection, or press Escape to work with the whole layer.');
       }
-      const image = engine.getImageSource(layer.sourceAssetId);
-      if (!image) throw new Error('The source image has not loaded.');
-      const w = layer.sourceWidth;
-      const h = layer.sourceHeight;
-      if (!w || !h) throw new Error('Invalid layer dimensions.');
+
+      // This is the existing LAYER mask in source-image coordinates.
+      // The lasso mask is created separately, after raster extraction.
       const maskCanvas = clipboardCanvas(w, h);
       const ctx = maskCanvas.getContext('2d');
       if (!ctx) throw new Error('Canvas is unavailable.');
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, w, h);
+      let layerMaskSource: CanvasImageSource | undefined;
       if (layer.mask?.isEnabled) {
         let source: CanvasImageSource | undefined = maskCanvasesRef.current.get(layer.mask.maskAssetId) || engine.getImageSource(layer.mask.maskAssetId);
         if (!source) {
@@ -904,71 +1035,166 @@ export const StudioWorkspace: React.FC = () => {
           if (!blob) throw new Error('The existing mask is unavailable.');
           source = await clipboardDecode(blob);
         }
+        layerMaskSource = source;
         ctx.globalCompositeOperation = layer.mask.isInverted ? 'destination-out' : 'destination-in';
         ctx.drawImage(source, 0, 0, w, h);
         ctx.globalCompositeOperation = 'source-over';
       }
+
+      const image = engine.getImageSource(layer.sourceAssetId);
+      if (!image) throw new Error('The source image has not loaded.');
       const normalized: LayerNode = { ...layer, mask: layer.mask?.isEnabled
         ? { ...layer.mask, isInverted: false, density: 1 } : null };
       const result = await copyRasterSelection(normalized, bounds, image, normalized.mask ? maskCanvas : undefined);
       const output = await clipboardDecode(result.blob);
       const outputCtx = output.getContext('2d');
       if (!outputCtx) throw new Error('Canvas is unavailable.');
+      let preparedLassoMask: HTMLCanvasElement | null = null;
+      if (lasso) {
+        const lassoMask = clipboardCanvas(output.width, output.height);
+        const lassoCtx = lassoMask.getContext('2d');
+        if (!lassoCtx) throw new Error('Canvas is unavailable.');
+        const points = lasso.points;
+        lassoCtx.fillStyle = '#ffffff';
+        lassoCtx.beginPath();
+        lassoCtx.moveTo(points[0].x - result.bounds.x, points[0].y - result.bounds.y);
+        for (let i = 1; i < points.length; i++) {
+          lassoCtx.lineTo(points[i].x - result.bounds.x, points[i].y - result.bounds.y);
+        }
+        lassoCtx.closePath();
+        lassoCtx.fill('evenodd');
+        // One padded mask, in document pixels, is shared by Copy and Cut.
+        preparedLassoMask = lassoMask;
+        if (featherRadius > 0) {
+          const blurredMask = clipboardCanvas(lassoMask.width, lassoMask.height);
+          const blurredCtx = blurredMask.getContext('2d');
+          if (!blurredCtx) throw new Error('Canvas is unavailable.');
+          blurredCtx.filter = `blur(${featherRadius}px)`;
+          blurredCtx.drawImage(lassoMask, 0, 0);
+          blurredCtx.filter = 'none';
+          preparedLassoMask = blurredMask;
+        }
+        outputCtx.save();
+        outputCtx.globalCompositeOperation = 'destination-in';
+        outputCtx.drawImage(preparedLassoMask, 0, 0);
+        outputCtx.restore();
+      }
       const alpha = outputCtx.getImageData(0, 0, output.width, output.height).data;
       let hasPixels = false;
       for (let i = 3; i < alpha.length; i += 4) if (alpha[i]) { hasPixels = true; break; }
       if (!hasPixels) throw new Error('The selection contains no visible pixels of the active layer.');
-      const payload: StudioClipboard = { kind: 'pixels', ...result, layerName: layer.name };
+      const payload: StudioClipboard = { kind: 'pixels', bounds: result.bounds,
+        blob: lasso ? await clipboardPng(output) : result.blob, layerName: layer.name };
 
       if (operation === 'cut') {
+        // Work in native mask pixels, preserving the existing mask outside the cut.
+        const existingMask = layer.mask?.isEnabled ? layer.mask : null;
+        const maskWidth = existingMask?.width ?? w;
+        const maskHeight = existingMask?.height ?? h;
+        const cutMaskCanvas = clipboardCanvas(maskWidth, maskHeight);
+        const cutCtx = cutMaskCanvas.getContext('2d');
+        if (!cutCtx) throw new Error('Canvas is unavailable.');
+        cutCtx.fillStyle = '#ffffff';
+        cutCtx.fillRect(0, 0, maskWidth, maskHeight);
+        if (existingMask) {
+          if (!layerMaskSource) throw new Error('The existing mask is unavailable.');
+          cutCtx.globalCompositeOperation = existingMask.isInverted ? 'destination-out' : 'destination-in';
+          cutCtx.drawImage(layerMaskSource, 0, 0, maskWidth, maskHeight);
+          cutCtx.globalCompositeOperation = 'source-over';
+        }
+
         const matrix = clipboardLayerMatrix(layer);
         const determinant = matrix.a * matrix.d - matrix.b * matrix.c;
-        if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) throw new Error('The layer transform is not invertible.');
+        if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) {
+          throw new Error('The layer transform is not invertible.');
+        }
         const inverse = matrix.inverse();
-        const points = [[bounds.x, bounds.y], [bounds.x + bounds.width, bounds.y],
-          [bounds.x + bounds.width, bounds.y + bounds.height], [bounds.x, bounds.y + bounds.height]]
-          .map(([x, y]) => inverse.transformPoint({ x, y }));
-        ctx.globalCompositeOperation = 'destination-out';
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-        points.slice(1).forEach(point => ctx.lineTo(point.x, point.y));
-        ctx.closePath();
-        ctx.fill();
-        ctx.globalCompositeOperation = 'source-over';
-        const blob = await clipboardPng(maskCanvas);
-        const bwCanvas = clipboardCanvas(w, h);
+        cutCtx.save();
+        cutCtx.globalCompositeOperation = 'destination-out';
+        if (lasso) {
+          if (!preparedLassoMask) throw new Error('The lasso mask is unavailable.');
+          // Translate the SAME document-space mask into native mask pixels.
+          // Blur happens before this transform, so zoom and layer scaling do
+          // not change the requested radius in document pixels.
+          const selectionToMask = new DOMMatrix()
+            .scale(maskWidth / w, maskHeight / h)
+            .multiply(inverse)
+            .translate(result.bounds.x, result.bounds.y);
+          cutCtx.setTransform(selectionToMask.a, selectionToMask.b,
+            selectionToMask.c, selectionToMask.d, selectionToMask.e, selectionToMask.f);
+          cutCtx.drawImage(preparedLassoMask, 0, 0);
+        } else {
+          // Preserve the existing rectangular Cut behavior.
+          const contour = [
+            { x: bounds.x, y: bounds.y },
+            { x: bounds.x + bounds.width, y: bounds.y },
+            { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
+            { x: bounds.x, y: bounds.y + bounds.height },
+          ];
+          const maskPoints = contour.map(point => {
+            const local = inverse.transformPoint(point);
+            return { x: local.x * maskWidth / w, y: local.y * maskHeight / h };
+          });
+          cutCtx.beginPath();
+          cutCtx.moveTo(maskPoints[0].x, maskPoints[0].y);
+          for (let i = 1; i < maskPoints.length; i++) {
+            cutCtx.lineTo(maskPoints[i].x, maskPoints[i].y);
+          }
+          cutCtx.closePath();
+          cutCtx.fill('evenodd');
+        }
+        cutCtx.restore();
+
+        const alphaBlob = await clipboardPng(cutMaskCanvas);
+        const bwCanvas = clipboardCanvas(maskWidth, maskHeight);
         const bwCtx = bwCanvas.getContext('2d');
         if (!bwCtx) throw new Error('Canvas is unavailable.');
-        const data = ctx.getImageData(0, 0, w, h);
-        for (let i = 0; i < data.data.length; i += 4) {
-          data.data[i] = data.data[i + 1] = data.data[i + 2] = data.data[i + 3];
-          data.data[i + 3] = 255;
+        const maskPixels = cutCtx.getImageData(0, 0, maskWidth, maskHeight);
+        for (let i = 0; i < maskPixels.data.length; i += 4) {
+          maskPixels.data[i] = maskPixels.data[i + 1] = maskPixels.data[i + 2] = maskPixels.data[i + 3];
+          maskPixels.data[i + 3] = 255;
         }
-        bwCtx.putImageData(data, 0, 0);
-        const id = `cut-mask-${crypto.randomUUID()}`;
-        await storeBinaryAsset(id, blob);
-        await storeBinaryAsset(`bw_${id}`, await clipboardPng(bwCanvas));
-        const current = assertCurrent([layer]);
-        if (useDocumentStore.getState().isLayerLocked(layer.id)) throw new Error('The layer is locked.');
-        const next = structuredClone(current);
-        next.assets[id] = { id, name: `${layer.name} Mask`, mimeType: 'image/png', width: w, height: h,
-          sizeBytes: blob.size, storageKey: id, createdAt: Date.now() };
-        next.layers[layer.id].mask = { id: `mask-${crypto.randomUUID()}`, maskAssetId: id,
-          width: w, height: h, isEnabled: true, isLinked: true, isInverted: false,
-          isClamping: true, feather: 0, density: 1 };
-        commit(next);
-        engine.registerImageSource(id, maskCanvas);
-        maskCanvasesRef.current.set(id, maskCanvas);
-        setMaskPreviews(previous => ({ ...previous, [id]: maskCanvas.toDataURL('image/png') }));
+        bwCtx.putImageData(maskPixels, 0, 0);
+        const bwBlob = await clipboardPng(bwCanvas);
+        const maskAssetId = `cut-mask-${crypto.randomUUID()}`;
+        await storeBinaryAsset(maskAssetId, alphaBlob);
+        await storeBinaryAsset(`bw_${maskAssetId}`, bwBlob);
+
+        const currentDoc = assertCurrent([layer]);
+        if (useDocumentStore.getState().isLayerLocked(layer.id)) {
+          throw new Error('Unlock the layer or its parent group first.');
+        }
+        const nextDoc = structuredClone(currentDoc);
+        nextDoc.assets[maskAssetId] = {
+          id: maskAssetId, name: `${layer.name} Mask`, mimeType: 'image/png',
+          width: maskWidth, height: maskHeight, sizeBytes: alphaBlob.size,
+          storageKey: maskAssetId, createdAt: Date.now(),
+        };
+        const updatedMask: LayerMask = {
+          id: `mask-${crypto.randomUUID()}`, maskAssetId,
+          width: maskWidth, height: maskHeight,
+          isEnabled: true, isLinked: existingMask?.isLinked ?? true,
+          isInverted: false, isClamping: existingMask?.isClamping ?? true,
+          feather: existingMask?.feather ?? 0, density: 1,
+        };
+        nextDoc.layers[layer.id].mask = updatedMask;
+        commit(nextDoc);
+
+        engine.registerImageSource(maskAssetId, cutMaskCanvas);
+        maskCanvasesRef.current.set(maskAssetId, cutMaskCanvas);
+        setMaskPreviews(previous => ({ ...previous, [maskAssetId]: cutMaskCanvas.toDataURL('image/png') }));
         clipboardRef.current = payload;
         setHasClipboard(true);
         selectionForClipboardRef.current = null;
         setMarqueeSelection(null);
+        setLassoSelection(null);
+        setMouseCanvasPos(null);
         await publish();
       } else {
         assertCurrent([layer]);
         clipboardRef.current = payload;
         setHasClipboard(true);
+        if (isLasso) setLassoSelection(null);
       }
     }
     finished = true;
@@ -982,7 +1208,20 @@ export const StudioWorkspace: React.FC = () => {
     clipboardBusyRef.current = false;
     if (changed && !finished) console.warn('[StudioWorkspace] Save the document again before closing.');
   }
-}, [addToast, setActiveTool, setActiveEditTarget, setMarqueeSelection]);
+}, [addToast, setActiveTool, setActiveEditTarget, setMarqueeSelection, lassoSelection, setLassoSelection, feather]);
+
+const completeLasso = useCallback(() => {
+  if (!lassoSelection?.active) return;
+  const distinctPoints = new Set(lassoSelection.points.map(point => `${point.x},${point.y}`));
+  if (distinctPoints.size < 3) {
+    addToast({ type: 'warning', title: 'Lasso incomplete', message: 'Add at least three different vertices.' });
+    return;
+  }
+  setLassoSelection(previous => previous === lassoSelection
+    ? { ...previous, active: false }
+    : previous);
+  setMouseCanvasPos(null);
+}, [lassoSelection, addToast]);
 
 const handleCopy = useCallback(() => handleClipboardOperation('copy'), [handleClipboardOperation]);
 const handleCut = useCallback(() => handleClipboardOperation('cut'), [handleClipboardOperation]);
@@ -1005,6 +1244,27 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
         (activeEl instanceof HTMLElement && activeEl.isContentEditable)
       ) {
         return;
+      }
+
+      if (
+        activeTool === 'lasso' &&
+        lassoSelection?.active &&
+        lassoSelection.type === 'polygonal' &&
+        !e.ctrlKey && !e.metaKey && !e.altKey
+      ) {
+        if (e.key === 'Backspace' || e.key === 'Delete') {
+          e.preventDefault();
+          setLassoSelection(previous => previous?.active && previous.type === 'polygonal'
+            ? { ...previous, points: previous.points.slice(0, -1) }
+            : previous);
+          setMouseCanvasPos(null);
+          return;
+        }
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          completeLasso();
+          return;
+        }
       }
 
       if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
@@ -1044,8 +1304,22 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
       } else if (e.code === 'KeyM') {
         setActiveTool('marquee');
         setMarqueeSelection(null);
-      } else if (e.key === 'Escape') {
+        setLassoSelection(null);
+      } else if (e.code === 'KeyS' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        setActiveTool('cloneStamp');
         setMarqueeSelection(null);
+        setLassoSelection(null);
+      } else if (e.code === 'KeyL') {
+        setActiveTool('lasso');
+        setLassoMode('freehand');
+        setMarqueeSelection(null);
+        setLassoSelection(null);
+        setMouseCanvasPos(null);
+      } else if (e.key === 'Escape') {
+        cloneStampCancelRef.current();
+        setMarqueeSelection(null);
+        setLassoSelection(null);
+        setMouseCanvasPos(null);
       } else if (e.code === 'KeyX') {
         setBrushColor((c) => (c === 'black' ? 'white' : 'black'));
       } else if (e.key === '[') {
@@ -1057,13 +1331,17 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleCopy, handlePaste, handleCut]);
-
-
+  }, [handleCopy, handlePaste, handleCut, activeTool, lassoSelection, completeLasso]);
 
   // --------------------------------------------------------------------------
   // 5. Image & Background Plate Ingestion Pipeline
   // --------------------------------------------------------------------------
+  // Cancel a contour when its tool, mode, layer or project changes.
+  useEffect(() => {
+    setLassoSelection(null);
+    setMouseCanvasPos(null);
+  }, [activeTool, lassoMode, activeLayer?.id, activeProjectId]);
+
   const handleAddImageFile = async (file: File) => {
     if (!file) return;
 
@@ -1959,7 +2237,173 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
     }
   };
 
+  const cancelCloneStampStroke = useCallback(() => {
+    const stroke = cloneStampStrokeRef.current;
+    if (!stroke) return;
+    cloneStampStrokeRef.current = null;
+    setIsPainting(false);
+    stroke.engine.unregisterImageSource(stroke.previewId);
+    const current = useDocumentStore.getState().document;
+    if (engineRef.current === stroke.engine && current) {
+      stroke.engine.setDocument(current);
+      stroke.engine.render();
+    }
+  }, []);
+
+  useEffect(() => {
+    setCloneStampSource(null);
+  }, [activeLayer?.id, activeProjectId]);
+
+  useEffect(() => {
+    const stroke = cloneStampStrokeRef.current;
+    if (stroke && (activeTool !== 'cloneStamp' || activeLayer?.id !== stroke.layer.id ||
+        (activeProjectId ?? null) !== stroke.projectId)) cancelCloneStampStroke();
+  }, [activeTool, activeLayer?.id, activeProjectId, cancelCloneStampStroke]);
+
+  cloneStampCancelRef.current = cancelCloneStampStroke;
+
+  const finishCloneStampStroke = useCallback(async () => {
+    const stroke = cloneStampStrokeRef.current;
+    if (!stroke || cloneStampSavingRef.current) return;
+    cloneStampStrokeRef.current = null;
+    cloneStampSavingRef.current = true;
+    setCloneStampSaving(true);
+    setIsPainting(false);
+    let committed = false;
+    try {
+      const assertTarget = () => {
+        const current = useDocumentStore.getState().document;
+        const context = cloneStampContextRef.current;
+        if (!current || current.id !== stroke.documentId || engineRef.current !== stroke.engine ||
+            context.projectId !== stroke.projectId || context.layerId !== stroke.layer.id ||
+            context.tool !== 'cloneStamp' || current.layers[stroke.layer.id] !== stroke.layer) {
+          throw new Error('The clone target changed. The stroke was cancelled.');
+        }
+        if (useDocumentStore.getState().isLayerLocked(stroke.layer.id)) throw new Error('The layer is locked.');
+        return current;
+      };
+      assertTarget();
+      const blob = await clipboardPng(stroke.working);
+      const assetId = `clone-${crypto.randomUUID()}`;
+      await storeBinaryAsset(assetId, blob);
+      const next = structuredClone(assertTarget());
+      next.assets[assetId] = {
+        id: assetId, name: `${stroke.layer.name} Clone Stamp`, mimeType: 'image/png',
+        width: stroke.working.width, height: stroke.working.height,
+        sizeBytes: blob.size, storageKey: assetId, createdAt: Date.now(),
+      };
+      next.layers[stroke.layer.id].sourceAssetId = assetId;
+      next.updatedAt = Date.now();
+      if (!useDocumentStore.getState().setDocument(next)) throw new Error('Could not register the cloned image.');
+      committed = true;
+      stroke.engine.registerImageSource(assetId, stroke.working);
+      stroke.engine.unregisterImageSource(stroke.previewId);
+      const updated = useDocumentStore.getState().document!;
+      stroke.engine.setDocument(updated);
+      stroke.engine.render();
+      await saveDocument(updated);
+      setLastSavedTime(Date.now());
+      if (canvasRef.current && engineRef.current === stroke.engine &&
+          useDocumentStore.getState().document?.id === stroke.documentId) {
+        try {
+          const thumbnail = generateCompositeThumbnailFromCanvas(canvasRef.current, 640);
+          if (thumbnail) {
+            const projectId = stroke.projectId || stroke.documentId;
+            setCachedThumbnail(projectId, thumbnail);
+            updateProject(projectId, { thumbnailUrl: thumbnail, updatedAt: new Date().toISOString() });
+            await storeBinaryAsset(`thumb_${projectId}`, dataUrlToBlob(thumbnail));
+          }
+        } catch (error) {
+          console.warn('[StudioWorkspace] Clone thumbnail:', error);
+        }
+      }
+    } catch (error) {
+      stroke.engine.unregisterImageSource(stroke.previewId);
+      const current = useDocumentStore.getState().document;
+      if (engineRef.current === stroke.engine && current) {
+        stroke.engine.setDocument(current);
+        stroke.engine.render();
+      }
+      addToast({ type: 'error', title: committed ? 'Clone applied, save failed' : 'Clone Stamp Failed',
+        message: error instanceof Error ? error.message : 'Could not clone the image.' });
+    } finally {
+      cloneStampSavingRef.current = false;
+      setCloneStampSaving(false);
+    }
+  }, [addToast, updateProject]);
+
   const handleMouseDown = (e: React.MouseEvent) => {
+    // Clone Stamp handles Alt-click before the workspace pan shortcut.
+    if (e.button === 0 && activeTool === 'cloneStamp') {
+      e.preventDefault();
+      if (cloneStampSavingRef.current || cloneStampStrokeRef.current || clipboardBusyRef.current) return;
+      try {
+        const store = useDocumentStore.getState();
+        const current = store.document;
+        const target = current?.activeLayerId ? current.layers[current.activeLayerId] : null;
+        const engine = engineRef.current;
+        const canvas = canvasRef.current;
+        if (!current || !target || !engine || !canvas) throw new Error('Select an image layer first.');
+        if (target.type !== 'raster' && target.type !== 'harmonized_clone') throw new Error('Select a raster image layer.');
+        if (target.parentId) throw new Error('Clone Stamp currently requires a top-level image layer.');
+        if (store.isLayerLocked(target.id)) throw new Error('Unlock the layer or its parent group first.');
+        if (!target.sourceAssetId || !target.sourceWidth || !target.sourceHeight) throw new Error('Layer image is unavailable.');
+        const matrix = clipboardLayerMatrix(target);
+        const determinant = matrix.a * matrix.d - matrix.b * matrix.c;
+        if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) throw new Error('The layer transform is not invertible.');
+        const inverse = matrix.inverse();
+        const rect = canvas.getBoundingClientRect();
+        const docPoint = { x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom };
+        const local = inverse.transformPoint(docPoint);
+        setMouseCanvasPos(docPoint);
+        if (e.altKey) {
+          if (local.x < 0 || local.y < 0 || local.x >= target.sourceWidth || local.y >= target.sourceHeight) {
+            throw new Error('Choose a source point inside the selected image.');
+          }
+          setCloneStampSource({ x: local.x, y: local.y, layerId: target.id });
+          return;
+        }
+        if (!cloneStampSource || cloneStampSource.layerId !== target.id) throw new Error('Alt-click the image to set a source first.');
+        const source = engine.getImageSource(target.sourceAssetId);
+        if (!source) throw new Error('Wait for the image to load.');
+        const snapshot = clipboardCanvas(target.sourceWidth, target.sourceHeight);
+        const working = clipboardCanvas(target.sourceWidth, target.sourceHeight);
+        const snapshotCtx = snapshot.getContext('2d');
+        const workingCtx = working.getContext('2d');
+        if (!snapshotCtx || !workingCtx) throw new Error('Canvas is unavailable.');
+        snapshotCtx.drawImage(source, 0, 0, snapshot.width, snapshot.height);
+        workingCtx.drawImage(snapshot, 0, 0);
+        const previewId = `clone-preview-${crypto.randomUUID()}`;
+        const previewDocument = structuredClone(current);
+        previewDocument.assets[previewId] = {
+          id: previewId, name: 'Clone preview', mimeType: 'image/png',
+          width: working.width, height: working.height, sizeBytes: 0,
+          storageKey: previewId, createdAt: Date.now(),
+        };
+        previewDocument.layers[target.id].sourceAssetId = previewId;
+        const stroke: CloneStampStroke = {
+          documentId: current.id, projectId: activeProjectId ?? null, layer: target, engine,
+          snapshot, working, previewDocument, previewId, inverse,
+          offsetX: local.x - cloneStampSource.x, offsetY: local.y - cloneStampSource.y,
+          last: { x: local.x, y: local.y }, settings: { ...cloneStampSettings },
+        };
+        cloneStampStrokeRef.current = stroke;
+        paintCloneStampStroke(workingCtx, snapshot, local.x, local.y, local.x, local.y,
+          stroke.offsetX, stroke.offsetY, stroke.settings.size / 2,
+          stroke.settings.hardness, stroke.settings.opacity);
+        engine.registerImageSource(previewId, working);
+        engine.setDocument(previewDocument);
+        engine.render();
+        setIsPainting(true);
+      } catch (error) {
+        cancelCloneStampStroke();
+        addToast({ type: 'warning', title: 'Clone Stamp',
+          message: error instanceof Error ? error.message : 'Could not start cloning.' });
+      }
+      return;
+    }
+
+
     if (placingLight && e.button === 0 && doc && activeLayer && canvasRef.current && !activeLayer.locked) {
       const rect = canvasRef.current.getBoundingClientRect();
       const docX = (e.clientX - rect.left) / zoom;
@@ -1990,6 +2434,69 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
       const startX = (e.clientX - rect.left) / zoom;
       const startY = (e.clientY - rect.top) / zoom;
       setMarqueeSelection({ startX, startY, currentX: startX, currentY: startY, active: true });
+      return;
+    }
+
+    // Lasso tools — left mouse button
+    if (
+      e.button === 0 &&
+      activeTool === 'lasso' &&
+      canvasRef.current
+    ) {
+      e.preventDefault();
+
+      const rect = canvasRef.current.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / zoom;
+      const y = (e.clientY - rect.top) / zoom;
+
+      setMouseCanvasPos({ x, y });
+
+      // Start a new contour, including after deleting the last vertex.
+      if (
+        lassoMode === 'freehand' ||
+        !lassoSelection ||
+        !lassoSelection.active ||
+        lassoSelection.type !== lassoMode ||
+        lassoSelection.points.length === 0
+      ) {
+        setLassoSelection({
+          points: [{ x, y }],
+          active: true,
+          type: lassoMode,
+        });
+        return;
+      }
+
+      // An active polygon with at least one vertex exists here.
+      const points = lassoSelection.points;
+      const firstPoint = points[0];
+
+      const distinctPoints = new Set(
+        points.map(point => `${point.x},${point.y}`)
+      );
+
+      const distanceInScreenPixels =
+        Math.hypot(x - firstPoint.x, y - firstPoint.y) * zoom;
+
+      if (distinctPoints.size >= 3 && distanceInScreenPixels <= 8) {
+        completeLasso();
+        return;
+      }
+
+      // Avoid adding an identical consecutive vertex.
+      const lastPoint = points[points.length - 1];
+
+      if (lastPoint.x !== x || lastPoint.y !== y) {
+        setLassoSelection(previous =>
+          previous
+            ? {
+                ...previous,
+                points: [...previous.points, { x, y }],
+              }
+            : previous
+        );
+      }
+
       return;
     }
 
@@ -2206,6 +2713,76 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
       return;
     }
 
+    if (activeTool === 'cloneStamp' && !isPanning && canvasRef.current) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const point = { x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom };
+      setMouseCanvasPos(point);
+      const stroke = cloneStampStrokeRef.current;
+      if (stroke && (e.buttons & 1) !== 0) {
+        try {
+          const current = useDocumentStore.getState().document;
+          if (!current || current.id !== stroke.documentId || current.layers[stroke.layer.id] !== stroke.layer ||
+              useDocumentStore.getState().isLayerLocked(stroke.layer.id)) {
+            cancelCloneStampStroke();
+            return;
+          }
+          const local = stroke.inverse.transformPoint(point);
+          if (Math.hypot(local.x - stroke.last.x, local.y - stroke.last.y) < 1e-6) return;
+          const ctx = stroke.working.getContext('2d');
+          if (!ctx) throw new Error('Canvas is unavailable.');
+          paintCloneStampStroke(ctx, stroke.snapshot, stroke.last.x, stroke.last.y, local.x, local.y,
+            stroke.offsetX, stroke.offsetY, stroke.settings.size / 2,
+            stroke.settings.hardness, stroke.settings.opacity);
+          stroke.last = { x: local.x, y: local.y };
+          stroke.engine.setDocument(stroke.previewDocument);
+          stroke.engine.render();
+        } catch (error) {
+          cancelCloneStampStroke();
+          addToast({ type: 'error', title: 'Clone Stamp Failed', message: error instanceof Error ? error.message : 'Could not paint.' });
+        }
+      }
+      return;
+    }
+
+    if (!isPanning && activeTool === 'lasso' && lassoSelection?.active) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / zoom;
+      const y = (e.clientY - rect.top) / zoom;
+
+      if (lassoSelection.type === 'freehand') {
+        if ((e.buttons & 1) === 0) return;
+        setLassoSelection(previous => {
+          if (
+            !previous ||
+            !previous.active ||
+            previous.type !== 'freehand'
+          ) {
+            return previous;
+          }
+
+          const lastPoint =
+            previous.points[previous.points.length - 1];
+
+          if (lastPoint?.x === x && lastPoint?.y === y) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            points: [...previous.points, { x, y }],
+          };
+        });
+      } else {
+        // Polygon vertices are added only by clicks.
+        setMouseCanvasPos({ x, y });
+      }
+
+      return;
+    }
+
     if (activeTool === 'brush' && canvasRef.current) {
       const rect = canvasRef.current.getBoundingClientRect();
       setMouseCanvasPos({
@@ -2390,6 +2967,13 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
   };
 
   const handleMouseUp = (e?: MouseEvent | React.MouseEvent) => {
+    if (cloneStampSavingRef.current) return;
+    if (cloneStampStrokeRef.current) {
+      // Include the release position even when the last move event was outside.
+      if (e) handleMouseMove({ ...e, clientX: e.clientX, clientY: e.clientY, buttons: 1 } as MouseEvent);
+      return finishCloneStampStroke();
+    }
+
     if (activeTool === 'marquee' && marqueeSelection?.active) {
       if (e && canvasRef.current) {
         const rect = canvasRef.current.getBoundingClientRect();
@@ -2402,6 +2986,15 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
       return;
     }
 
+    if (!isPanning && activeTool === 'lasso' && lassoSelection?.active) {
+      if (lassoSelection.type === 'polygonal') return;
+      const distinctPoints = new Set(lassoSelection.points.map(point => `${point.x},${point.y}`));
+      setLassoSelection(previous => previous && distinctPoints.size >= 3
+        ? { ...previous, active: false }
+        : null);
+      return;
+    }
+
     if (isPanning) {
       setIsPanning(false);
     }
@@ -2410,7 +3003,7 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
       setIsPainting(false);
       lastPaintPosRef.current = null;
 
-      if (activeLayer?.mask?.maskAssetId) {
+      if (activeTool === 'brush' && activeLayer?.mask?.maskAssetId) {
         const maskAssetId = activeLayer.mask.maskAssetId;
         const mCanvas = maskCanvasesRef.current.get(maskAssetId);
         if (mCanvas) {
@@ -2512,16 +3105,23 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
     }
   };
 
-  // Global window listeners for drag, resize & paint to prevent stuttering when mouse moves quickly
+  // Window listeners also finish freehand strokes outside the viewport.
+  const mouseHandlersRef = useRef({ move: handleMouseMove, up: handleMouseUp });
+  mouseHandlersRef.current = { move: handleMouseMove, up: handleMouseUp };
+
   useEffect(() => {
-    if (!isResizingLayer && !isDraggingLayer && !isPainting && !(activeTool === 'marquee' && marqueeSelection?.active)) return;
+    const lassoIsActive = activeTool === 'lasso' && lassoSelection?.active;
+    if (!isResizingLayer && !isDraggingLayer && !isPainting &&
+        !(activeTool === 'marquee' && marqueeSelection?.active) && !lassoIsActive) return;
 
-    const onWindowMouseMove = (e: MouseEvent) => {
-      handleMouseMove(e);
+    const handledByViewport = (event: MouseEvent) =>
+      event.target instanceof Node && !!viewportRef.current?.contains(event.target);
+    const onWindowMouseMove = (event: MouseEvent) => {
+      // Inside the viewport React already dispatches the same event.
+      if (!handledByViewport(event)) mouseHandlersRef.current.move(event);
     };
-
-    const onWindowMouseUp = (e: MouseEvent) => {
-      handleMouseUp(e);
+    const onWindowMouseUp = (event: MouseEvent) => {
+      if (!handledByViewport(event)) mouseHandlersRef.current.up(event);
     };
 
     window.addEventListener('mousemove', onWindowMouseMove);
@@ -2530,7 +3130,8 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
       window.removeEventListener('mousemove', onWindowMouseMove);
       window.removeEventListener('mouseup', onWindowMouseUp);
     };
-  }, [isResizingLayer, isDraggingLayer, isPainting, activeTool, marqueeSelection?.active, zoom]);
+  }, [isResizingLayer, isDraggingLayer, isPainting, activeTool,
+      marqueeSelection?.active, lassoSelection?.active, zoom]);
 
   // --------------------------------------------------------------------------
   // 10. Drag & Drop Image Handlers
@@ -2788,6 +3389,40 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
           </button>
           <button
             onClick={() => {
+              setActiveTool('lasso');
+              setLassoMode('freehand');
+              setMarqueeSelection(null);
+              setLassoSelection(null);
+              setMouseCanvasPos(null);
+            }}
+            className={`p-2 rounded-lg cursor-pointer transition-all ${
+              activeTool === 'lasso' && lassoMode === 'freehand'
+                ? 'bg-gradient-to-b from-[#8E24AA] to-[#7A1FA2] text-[#D7DEED] shadow-xs'
+                : 'text-[#8E9AB8] hover:text-[#D7DEED] hover:bg-[#171B29]'
+            }`}
+            title="Lasso Tool (L) - Freehand Select"
+          >
+            <Sparkles className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => {
+              setActiveTool('lasso');
+              setLassoMode('polygonal');
+              setMarqueeSelection(null);
+              setLassoSelection(null);
+              setMouseCanvasPos(null);
+            }}
+            className={`p-2 rounded-lg cursor-pointer transition-all ${
+              activeTool === 'lasso' && lassoMode === 'polygonal'
+                ? 'bg-gradient-to-b from-[#8E24AA] to-[#7A1FA2] text-[#D7DEED] shadow-xs'
+                : 'text-[#8E9AB8] hover:text-[#D7DEED] hover:bg-[#171B29]'
+            }`}
+            title="Polygonal Lasso Tool - Polygonal Select"
+          >
+            <BookmarkPlus className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => {
               setActiveTool('pan');
               setMarqueeSelection(null);
             }}
@@ -2799,6 +3434,20 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
             title="Hand & Pan Canvas Tool (H / Space+Drag)"
           >
             <Hand className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => {
+              setActiveTool('cloneStamp');
+              setMarqueeSelection(null);
+            }}
+            className={`p-2 rounded-lg cursor-pointer transition-all ${
+              activeTool === 'cloneStamp'
+                ? 'bg-gradient-to-b from-[#8E24AA] to-[#7A1FA2] text-[#D7DEED] shadow-xs'
+                : 'text-[#8E9AB8] hover:text-[#D7DEED] hover:bg-[#171B29]'
+            }`}
+            title="Clone Stamp Tool (S)"
+          >
+            <Stamp className="w-4 h-4" />
           </button>
         </div>
 
@@ -2822,13 +3471,118 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
                 : 'cursor-nesw-resize'
               : isDraggingLayer
               ? 'cursor-grabbing'
-              : activeTool === 'brush'
+              : activeTool === 'brush' || activeTool === 'cloneStamp'
               ? 'cursor-crosshair'
               : activeTool === 'move'
               ? 'cursor-move'
               : 'cursor-default'
           }`}
         >
+          {/* Lasso controls stay readable at every canvas zoom. */}
+          {activeTool === 'lasso' && (lassoMode === 'polygonal' || lassoSelection) && (
+            <div
+              className="absolute top-4 right-4 z-50 max-w-sm p-3 bg-[#131724]/95 border border-[#7A1FA2] rounded-lg shadow-xl pointer-events-auto"
+              onMouseDown={event => event.stopPropagation()}
+              onMouseUp={event => event.stopPropagation()}
+              onMouseMove={event => event.stopPropagation()}
+              onClick={event => event.stopPropagation()}
+            >
+              {lassoSelection && !lassoSelection.active ? (
+                <>
+                  <p className="mb-2 text-sm text-white">Selection finished</p>
+                  <div className="flex flex-wrap gap-2">
+                    <button type="button" onClick={() => { void handleCopy(); }}
+                      className="px-3 py-2 bg-[#8E24AA] text-white rounded text-sm hover:bg-[#7A1FA2] cursor-pointer">
+                      Copy
+                    </button>
+                    <button type="button" onClick={() => { void handleCut(); }}
+                      className="px-3 py-2 bg-[#8E24AA] text-white rounded text-sm hover:bg-[#7A1FA2] cursor-pointer">
+                      Cut
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    disabled={!lassoSelection?.active || new Set(lassoSelection.points.map(point => `${point.x},${point.y}`)).size < 3}
+                    onClick={completeLasso}
+                    className="px-3 py-2 bg-[#8E24AA] text-white rounded text-sm font-bold hover:bg-[#7A1FA2] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Finish Selection
+                  </button>
+                  <p className="mt-2 text-xs leading-relaxed text-[#D7DEED]">
+                    {lassoMode === 'polygonal'
+                      ? 'Click along the contour. Enter — finish, Backspace — remove point, Esc — cancel.'
+                      : 'Drag around the object and release to finish. Esc — cancel.'}
+                  </p>
+                </>
+              )}
+              <div className="mt-3 flex items-center gap-2">
+                <label htmlFor="lasso-feather" className="text-xs text-[#D7DEED]">Feather</label>
+                <input
+                  id="lasso-feather"
+                  type="range"
+                  min={0}
+                  max={20}
+                  step={1}
+                  value={feather}
+                  onChange={event => setFeather(Math.max(0, Math.min(20, Number(event.target.value))))}
+                  className="w-24 accent-[#7A1FA2]"
+                />
+                <span className="text-xs text-[#D7DEED]">{feather} px</span>
+              </div>
+              <p className="mt-1 text-xs text-[#8E9AB8]">Applied when copying or cutting.</p>
+              {lassoSelection && (
+                <button type="button"
+                  onClick={() => { setLassoSelection(null); setMouseCanvasPos(null); }}
+                  className="mt-2 px-3 py-1 text-sm text-[#D7DEED] hover:text-white cursor-pointer">
+                  Cancel Selection
+                </button>
+              )}
+            </div>
+          )}
+
+          {activeTool === 'cloneStamp' && (
+            <div
+              className="absolute top-3 left-1/2 -translate-x-1/2 z-40 flex flex-wrap items-center justify-center gap-3 px-3 py-2 rounded-xl bg-[#131724]/95 border border-[#293047] shadow-xl backdrop-blur-md"
+              onMouseDown={event => event.stopPropagation()}
+              onMouseUp={event => event.stopPropagation()}
+              onMouseMove={event => event.stopPropagation()}
+              onClick={event => event.stopPropagation()}
+            >
+              <span className="text-xs font-bold text-[#D7DEED]">Clone Stamp</span>
+              <label className="flex items-center gap-1.5 text-xs text-[#D7DEED]">
+                Size
+                <input aria-label="Clone Stamp Size" type="range" min={5} max={300}
+                  value={cloneStampSettings.size} disabled={cloneStampSaving || isPainting}
+                  onChange={event => setCloneStampSettings(previous => ({ ...previous, size: Number(event.target.value) }))}
+                  className="w-20 accent-[#38BDF8]" />
+                <span>{cloneStampSettings.size} px</span>
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-[#D7DEED]">
+                Hardness
+                <input aria-label="Clone Stamp Hardness" type="range" min={0} max={1} step={0.05}
+                  value={cloneStampSettings.hardness} disabled={cloneStampSaving || isPainting}
+                  onChange={event => setCloneStampSettings(previous => ({ ...previous, hardness: Number(event.target.value) }))}
+                  className="w-16 accent-[#BA68C8]" />
+                <span>{Math.round(cloneStampSettings.hardness * 100)}%</span>
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-[#D7DEED]">
+                Opacity
+                <input aria-label="Clone Stamp Opacity" type="range" min={0.05} max={1} step={0.05}
+                  value={cloneStampSettings.opacity} disabled={cloneStampSaving || isPainting}
+                  onChange={event => setCloneStampSettings(previous => ({ ...previous, opacity: Number(event.target.value) }))}
+                  className="w-16 accent-[#BA68C8]" />
+                <span>{Math.round(cloneStampSettings.opacity * 100)}%</span>
+              </label>
+              <p className="w-full text-center text-xs text-[#D7DEED]">
+                {cloneStampSaving ? 'Saving stroke...' : 'Alt-click to set source, then drag to clone. Esc cancels the current stroke.'}
+              </p>
+              {cloneStampSource && <span className="text-xs text-[#38BDF8]">Source set</span>}
+            </div>
+          )}
+
           {/* Contextual Brush & Mask Options Bar */}
           {activeTool === 'brush' && (
             <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 flex flex-wrap items-center gap-2.5 px-3 py-1.5 rounded-xl bg-[#131724]/95 border border-[#293047] shadow-xl backdrop-blur-md">
@@ -3060,6 +3814,56 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
 
             <canvas ref={canvasCallbackRef} className="block select-none pointer-events-none" />
 
+            {/* Lasso Selection Overlay */}
+            {lassoSelection && (
+              <svg
+                className="absolute inset-0 pointer-events-none z-30 w-full h-full"
+                viewBox={`0 0 ${doc.width} ${doc.height}`}
+                preserveAspectRatio="none"
+              >
+                {lassoSelection.active ? (
+                  <polyline
+                    points={[
+                      ...lassoSelection.points,
+                      ...(lassoSelection.type === 'polygonal' && lassoSelection.points.length > 0 && mouseCanvasPos
+                        ? [mouseCanvasPos] : []),
+                    ].map(point => `${point.x} ${point.y}`).join(' ')}
+                    fill="none"
+                    stroke="#BA68C8"
+                    strokeWidth="2"
+                    strokeDasharray={lassoSelection.type === 'polygonal' ? '4' : undefined}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                ) : (
+                  <polygon
+                    points={lassoSelection.points.map(point => `${point.x} ${point.y}`).join(' ')}
+                    fill="rgba(122, 31, 162, 0.2)"
+                    fillRule="evenodd"
+                    stroke="#BA68C8"
+                    strokeWidth="2"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                )}
+                {lassoSelection.active && lassoSelection.type === 'polygonal' &&
+                  lassoSelection.points.map((point, index) => (
+                    <circle
+                      key={index}
+                      cx={point.x}
+                      cy={point.y}
+                      r={(index === 0 ? 4 : 3) / zoom}
+                      fill={index === 0 ? '#ffffff' : '#BA68C8'}
+                      stroke="#BA68C8"
+                      strokeWidth="1"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ))}
+              </svg>
+            )}
+
+
+
+
+
           {/* Marquee Selection Overlay */}
           {marqueeSelection && (
             <div
@@ -3179,6 +3983,36 @@ const handlePaste = useCallback(() => handleClipboardOperation('paste'), [handle
                 </div>
               </div>
             )}
+
+            {activeTool === 'cloneStamp' && activeLayer && (() => {
+              const matrix = clipboardLayerMatrix(activeLayer);
+              const determinant = matrix.a * matrix.d - matrix.b * matrix.c;
+              if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12) return null;
+              const cursor = mouseCanvasPos ? matrix.inverse().transformPoint(mouseCanvasPos) : null;
+              const stroke = cloneStampStrokeRef.current;
+              const source = stroke && cursor
+                ? { x: cursor.x - stroke.offsetX, y: cursor.y - stroke.offsetY }
+                : cloneStampSource?.layerId === activeLayer.id ? cloneStampSource : null;
+              const marker = source ? matrix.transformPoint(source) : null;
+              return (
+                <svg className="absolute inset-0 pointer-events-none z-30 w-full h-full"
+                  viewBox={`0 0 ${doc.width} ${doc.height}`} preserveAspectRatio="none">
+                  {cursor && (
+                    <g transform={`matrix(${matrix.a} ${matrix.b} ${matrix.c} ${matrix.d} ${matrix.e} ${matrix.f})`}>
+                      <circle cx={cursor.x} cy={cursor.y} r={cloneStampSettings.size / 2}
+                        fill="rgba(255,255,255,0.06)" stroke="white" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+                    </g>
+                  )}
+                  {marker && (
+                    <g stroke="#38BDF8" fill="none" strokeWidth="1.5">
+                      <circle cx={marker.x} cy={marker.y} r={5 / zoom} vectorEffect="non-scaling-stroke" />
+                      <path d={`M ${marker.x - 9 / zoom} ${marker.y} H ${marker.x + 9 / zoom} M ${marker.x} ${marker.y - 9 / zoom} V ${marker.y + 9 / zoom}`}
+                        vectorEffect="non-scaling-stroke" />
+                    </g>
+                  )}
+                </svg>
+              );
+            })()}
 
             {/* Brush Stamp Preview Ring (Follows mouse on Canvas when Brush tool is active) */}
             {activeTool === 'brush' && mouseCanvasPos && (
